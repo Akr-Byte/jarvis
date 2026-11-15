@@ -357,7 +357,11 @@ def install_efficiency_runtime() -> None:
             if isinstance(result, str)
             else json.dumps(result, ensure_ascii=False, default=str)
         )
-        digest = hashlib.sha256(raw.encode()).hexdigest()
+        # CLI-18: key the dedupe digest on the tool call identity as well, so
+        # identical result text from different calls is not collapsed.
+        identity = local_agent._TOOL_IDENTITY.get()
+        identity_json = json.dumps(identity, sort_keys=True, default=str)
+        digest = hashlib.sha256((identity_json + "\x00" + raw).encode()).hexdigest()
         state = _RUN.get()
         if digest in result_cache:
             if state:
