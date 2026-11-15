@@ -70,6 +70,44 @@ jobs:
           python -c "from pathlib import Path; p=Path('tests/test_execution_hardening.py').read_text(); assert 'Authorization: Bearer abcdefghijklmnop' in p"
       - run: black --check --diff src tests
       - run: ruff check src tests --select E9,F63,F7,F82
+      - name: Configure Python toolcache shared libraries
+        shell: bash
+        run: |
+          TOOLCACHE="$HOME/actions-runner/_work/_tool/Python"
+          LIB_PATHS=()
+
+          for version in 3.10.* 3.12.* 3.13.*; do
+            for libdir in "$TOOLCACHE"/"$version"/x64/lib; do
+              if [ -d "$libdir" ]; then
+                LIB_PATHS+=("$libdir")
+                echo "Found: $libdir"
+              fi
+            done
+          done
+
+          if [ ${#LIB_PATHS[@]} -eq 0 ]; then
+            echo "No Python shared library directories found"
+            exit 1
+          fi
+
+          JOINED_PATH=$(IFS=:; echo "${LIB_PATHS[*]}")
+          echo "LD_LIBRARY_PATH=$JOINED_PATH:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          export LD_LIBRARY_PATH="$JOINED_PATH:${LD_LIBRARY_PATH:-}"
+          echo "Configured Python shared libraries"
+      - name: Verify Python matrix runtimes
+        shell: bash
+        run: |
+          TOOLCACHE="$HOME/actions-runner/_work/_tool/Python"
+
+          for version in 3.10.* 3.12.* 3.13.*; do
+            for py in "$TOOLCACHE"/"$version"/x64/bin/python; do
+              [ -x "$py" ] || continue
+
+              echo "Testing: $py"
+              "$py" --version
+              ldd "$py" | grep "not found" && exit 1 || true
+            done
+          done
       - name: Run tests from a clean source/bytecode state
         shell: bash
         run: |
