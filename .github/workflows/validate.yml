@@ -33,6 +33,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Configure Python shared library path
+        shell: bash
+        run: |
+          PYTHON_BIN="$(readlink -f "$(command -v python)")"
+          PYTHON_PREFIX="$(dirname "$(dirname "$PYTHON_BIN")")"
+
+          echo "Python prefix: $PYTHON_PREFIX"
+          echo "LD_LIBRARY_PATH=$PYTHON_PREFIX/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+          export LD_LIBRARY_PATH="$PYTHON_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+          python --version
+          python -c "import sys; print(sys.executable)"
       - name: Install Python development shared libraries
         # Needed so that subprocess launched Python can find libpython3.X.so.1.0
         # (avoids "error while loading shared libraries: libpython3.X.so.1.0"
