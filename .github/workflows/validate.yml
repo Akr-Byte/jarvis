@@ -35,14 +35,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install Python development shared libraries
         # Needed so that subprocess launched Python can find libpython3.X.so.1.0
-        # (avoids "error while loading shared libraries: libpython3.13.so.1.0"
-        # on self-hosted runners with Python 3.13).
+        # (avoids "error while loading shared libraries: libpython3.X.so.1.0"
+        # on self-hosted runners with Python 3.10+).
         run: |
           python -c "import sys; print(sys.executable)"
-          if [[ "${{ matrix.python-version }}" == "3.13" ]]; then
-            apt-get update && apt-get install -y libpython3.13-dev 2>/dev/null || \
-            apt-get update && apt-get install -y python3.13-dev 2>/dev/null || true
-          fi
+          for pyver in "3.10" "3.13"; do
+            if [[ "${{ matrix.python-version }}" == "$pyver" ]]; then
+              apt-get update -qq && apt-get install -y libpython$pyver-dev 2>/dev/null || true
+            fi
+          done
       - name: Install Jarvis and development dependencies
         run: python -m pip install --no-cache-dir -e . -r requirements.txt twine
       - name: Verify coordinated Core
