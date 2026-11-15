@@ -23,7 +23,6 @@ def test_release_version_check_does_not_import_runtime_dependencies():
     assert "import jarvis_cli" not in workflow
 
 
-
 def test_package_version_is_importable_without_runtime_dependencies():
     script = (
         "import builtins, sys; "
@@ -43,9 +42,7 @@ def test_package_version_is_importable_without_runtime_dependencies():
 
     env = {
         "PYTHONPATH": str(REPO_ROOT / "src"),
-        "LD_LIBRARY_PATH": os.pathsep.join(
-            path for path in loader_paths if path
-        ),
+        "LD_LIBRARY_PATH": os.pathsep.join(path for path in loader_paths if path),
     }
 
     result = subprocess.run(
@@ -68,4 +65,3 @@ def test_package_version_is_importable_without_runtime_dependencies():
     ).group(1)
 
     assert result.stdout.strip() == expected
-
