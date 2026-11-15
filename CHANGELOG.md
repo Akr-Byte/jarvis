@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Patch release 0.12.6
+
+- **Python toolcache shared library discovery**: `LD_LIBRARY_PATH` now auto-discovered from GitHub Actions Python toolcache (`$TOOLCACHE/3.10.*/x64/lib`, `$TOOLCACHE/3.12.*/x64/lib`, `$TOOLCACHE/3.13.*/x64/lib`), replacing the need for `apt-get install libpythonX-dev` on self-hosted runners
+- **Python runtime verification**: `libpythonX.so.1.0` existence checked before running Python; `LD_LIBRARY_PATH` set explicitly to verify subprocesses can find shared libraries
+- **Workflow cleanup**: Removed redundant `"Install Python development shared libraries"` apt-get step and duplicate `"Configure Python toolcache shared libraries"` step from `.github/workflows/validate.yml`
+- **Black formatting**: Applied formatting to test files for consistent code style
+
 ### World-class hardening (P0.6)
 
 - **MCP handshake (CLI-14)**: `HTTPMCPClient` now performs the real MCP
