@@ -21,7 +21,7 @@ permissions:
 jobs:
   validate-and-build:
     name: Validate and build exact release SHA
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -138,15 +138,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
-            platform: linux
+          - platform: linux
             arch: amd64
             suffix: ""
-          - os: windows-latest
-            platform: windows
-            arch: amd64
-            suffix: ".exe"
-    runs-on: ${{ matrix.os }}
+    runs-on: self-hosted
     permissions:
       id-token: write
     steps:
@@ -186,7 +181,7 @@ jobs:
     name: Publish validated GitHub release
     needs: [validate-and-build, binaries]
     if: needs.validate-and-build.outputs.release_needed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     permissions:
       contents: write
       id-token: write
@@ -223,7 +218,7 @@ jobs:
     name: Publish validated distributions to PyPI
     needs: [validate-and-build, github-release]
     if: needs.validate-and-build.outputs.release_needed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     environment:
       name: pypi
       url: https://pypi.org/project/jarvis-agent-cli/
