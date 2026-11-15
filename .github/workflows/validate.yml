@@ -73,27 +73,41 @@ jobs:
       - name: Configure Python toolcache shared libraries
         shell: bash
         run: |
+          set -euo pipefail
+
           TOOLCACHE="$HOME/actions-runner/_work/_tool/Python"
           LIB_PATHS=()
 
-          for version in 3.10.* 3.12.* 3.13.*; do
-            for libdir in "$TOOLCACHE"/"$version"/x64/lib; do
-              if [ -d "$libdir" ]; then
-                LIB_PATHS+=("$libdir")
-                echo "Found: $libdir"
-              fi
-            done
+          for version_dir in "$TOOLCACHE"/3.10.* "$TOOLCACHE"/3.12.* "$TOOLCACHE"/3.13.*; do
+            [ -d "$version_dir/x64/lib" ] || continue
+
+            libdir="$version_dir/x64/lib"
+            LIB_PATHS+=("$libdir")
+            echo "Found Python libraries: $libdir"
           done
 
-          if [ ${#LIB_PATHS[@]} -eq 0 ]; then
-            echo "No Python shared library directories found"
+          if [ "${#LIB_PATHS[@]}" -eq 0 ]; then
+            echo "::error::No Python shared library directories found"
+            find "$TOOLCACHE" -maxdepth 4 -type d -name lib
             exit 1
           fi
+      - name: Verify Python runtimes
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          JOINED_PATH=$(IFS=:; echo "${LIB_PATHS[*]}")
-          echo "LD_LIBRARY_PATH=$JOINED_PATH:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-          export LD_LIBRARY_PATH="$JOINED_PATH:${LD_LIBRARY_PATH:-}"
-          echo "Configured Python shared libraries"
+          TOOLCACHE="$HOME/actions-runner/_work/_tool/Python"
+
+          for version_dir in "$TOOLCACHE"/3.10.* "$TOOLCACHE"/3.12.* "$TOOLCACHE"/3.13.*; do
+            [ -x "$version_dir/x64/bin/python" ] || continue
+
+            PY="$version_dir/x64/bin/python"
+            echo "Checking $PY"
+
+            "$PY" --version
+            "$PY" -c "import sys; print(sys.executable)"
+            ldd "$PY" | grep "not found" && exit 1 || true
+          done
       - name: Verify Python matrix runtimes
         shell: bash
         run: |
