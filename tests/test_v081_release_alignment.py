@@ -2,6 +2,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+import os
 
 CORE_VERSION = "0.18.0"
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,7 @@ def test_release_version_check_does_not_import_runtime_dependencies():
     assert "import jarvis_cli" not in workflow
 
 
+
 def test_package_version_is_importable_without_runtime_dependencies():
     script = (
         "import builtins, sys; "
@@ -31,20 +33,39 @@ def test_package_version_is_importable_without_runtime_dependencies():
         "if name == 'jarvis_core' else real_import(name, *args, **kwargs); "
         "import jarvis_cli; print(jarvis_cli.__version__)"
     )
+
+    python_lib = Path(sys.executable).resolve().parent.parent / "lib"
+
+    loader_paths = [
+        str(python_lib),
+        os.environ.get("LD_LIBRARY_PATH", ""),
+    ]
+
+    env = {
+        "PYTHONPATH": str(REPO_ROOT / "src"),
+        "LD_LIBRARY_PATH": os.pathsep.join(
+            path for path in loader_paths if path
+        ),
+    }
+
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=REPO_ROOT,
-        env={"PYTHONPATH": str(REPO_ROOT / "src")},
+        env=env,
         text=True,
         capture_output=True,
         check=False,
     )
+
     assert result.returncode == 0, result.stderr
 
     package_init = (REPO_ROOT / "src/jarvis_cli/__init__.py").read_text(
         encoding="utf-8"
     )
-    expected = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", package_init).group(
-        1
-    )
+    expected = re.search(
+        r"__version__\s*=\s*['\"]([^'\"]+)['\"]",
+        package_init,
+    ).group(1)
+
     assert result.stdout.strip() == expected
+

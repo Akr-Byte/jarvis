@@ -89,12 +89,7 @@ jobs:
               echo "Python $version PASSED"
             done
           done
-          for pyver in "3.10" "3.13"; do
-            if [[ "${{ matrix.python-version }}" == "$pyver" ]]; then
-              apt-get update -qq && apt-get install -y libpython$pyver-dev 2>/dev/null || true
-            fi
-          done
-      - name: Install Jarvis and development dependencies
+          - name: Install Jarvis and development dependencies
         run: python -m pip install --no-cache-dir -e . -r requirements.txt twine
       - name: Verify coordinated Core
         run: |
@@ -108,27 +103,6 @@ jobs:
           python -c "from pathlib import Path; p=Path('tests/test_execution_hardening.py').read_text(); assert 'Authorization: Bearer abcdefghijklmnop' in p"
       - run: black --check --diff src tests
       - run: ruff check src tests --select E9,F63,F7,F82
-      - name: Configure Python toolcache shared libraries
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TOOLCACHE="$HOME/actions-runner/_work/_tool/Python"
-          LIB_PATHS=()
-
-          for version_dir in "$TOOLCACHE"/3.10.* "$TOOLCACHE"/3.12.* "$TOOLCACHE"/3.13.*; do
-            [ -d "$version_dir/x64/lib" ] || continue
-
-            libdir="$version_dir/x64/lib"
-            LIB_PATHS+=("$libdir")
-            echo "Found Python libraries: $libdir"
-          done
-
-          if [ "${#LIB_PATHS[@]}" -eq 0 ]; then
-            echo "::error::No Python shared library directories found"
-            find "$TOOLCACHE" -maxdepth 4 -type d -name lib
-            exit 1
-          fi
       - name: Run tests from a clean source/bytecode state
         shell: bash
         run: |
