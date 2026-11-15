@@ -33,24 +33,62 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Configure Python shared library path
+      - name: Configure Python toolcache shared libraries
         shell: bash
         run: |
-          PYTHON_BIN="$(readlink -f "$(command -v python)")"
-          PYTHON_PREFIX="$(dirname "$(dirname "$PYTHON_BIN")")"
+          set -euo pipefail
 
-          echo "Python prefix: $PYTHON_PREFIX"
-          echo "LD_LIBRARY_PATH=$PYTHON_PREFIX/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          TOOLCACHE="$HOME/actions-runner/_work/_tool/Python"
+          LIB_PATHS=()
 
-          export LD_LIBRARY_PATH="$PYTHON_PREFIX/lib:${LD_LIBRARY_PATH:-}"
-          python --version
-          python -c "import sys; print(sys.executable)"
-      - name: Install Python development shared libraries
-        # Needed so that subprocess launched Python can find libpython3.X.so.1.0
-        # (avoids "error while loading shared libraries: libpython3.X.so.1.0"
-        # on self-hosted runners with Python 3.10+).
+          for version in 3.10 3.12 3.13; do
+            for version_dir in "$TOOLCACHE/$version."*; do
+              [ -d "$version_dir/x64/lib" ] || continue
+
+              libdir="$version_dir/x64/lib"
+              LIB_PATHS+=("$libdir")
+              echo "Found: $libdir"
+            done
+          done
+
+          if [ "${#LIB_PATHS[@]}" -eq 0 ]; then
+            echo "::error::No Python library directories found"
+            exit 1
+          fi
+
+          JOINED_PATH=$(IFS=:; echo "${LIB_PATHS[*]}")
+          FINAL_PATH="$JOINED_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+          echo "LD_LIBRARY_PATH=$FINAL_PATH" >> "$GITHUB_ENV"
+
+          echo "Configured: $FINAL_PATH"
+      - name: Verify all Python runtimes
+        shell: bash
         run: |
-          python -c "import sys; print(sys.executable)"
+          set -euo pipefail
+
+          TOOLCACHE="$HOME/actions-runner/_work/_tool/Python"
+
+          for version in 3.10 3.12 3.13; do
+            for version_dir in "$TOOLCACHE/$version."*; do
+              PY="$version_dir/x64/bin/python"
+              LIB="$version_dir/x64/lib"
+
+              [ -x "$PY" ] || continue
+
+              echo "================================"
+              echo "Testing Python: $PY"
+
+              test -f "$LIB/libpython${version}.so.1.0"
+
+              LD_LIBRARY_PATH="$LIB" "$PY" --version
+
+              LD_LIBRARY_PATH="$LIB" "$PY" -c \
+                "import sys, subprocess; subprocess.run([sys.executable, '-c', 'import sys; print(sys.version)'], check=True)"
+
+              echo "Python $version PASSED"
+            done
+          done
           for pyver in "3.10" "3.13"; do
             if [[ "${{ matrix.python-version }}" == "$pyver" ]]; then
               apt-get update -qq && apt-get install -y libpython$pyver-dev 2>/dev/null || true
@@ -91,36 +129,6 @@ jobs:
             find "$TOOLCACHE" -maxdepth 4 -type d -name lib
             exit 1
           fi
-      - name: Verify Python toolcache runtimes
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TOOLCACHE="$HOME/actions-runner/_work/_tool/Python"
-
-          for version_dir in "$TOOLCACHE"/3.10.* "$TOOLCACHE"/3.12.* "$TOOLCACHE"/3.13.*; do
-            PY="$version_dir/x64/bin/python"
-            LIB="$version_dir/x64/lib"
-
-            [ -x "$PY" ] || continue
-
-            echo "================================"
-            echo "Checking: $PY"
-            echo "Library: $LIB"
-
-            if [ ! -f "$LIB/libpython$(basename "$version_dir" | cut -d. -f1,2).so.1.0" ]; then
-              echo "Python shared library missing: $LIB"
-              exit 1
-            fi
-
-            LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-              "$PY" --version
-
-            LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-              "$PY" -c "import sys; print(sys.executable)"
-
-            echo "Runtime OK"
-          done
       - name: Run tests from a clean source/bytecode state
         shell: bash
         run: |
