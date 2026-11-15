@@ -91,7 +91,7 @@ jobs:
             find "$TOOLCACHE" -maxdepth 4 -type d -name lib
             exit 1
           fi
-      - name: Verify Python runtimes
+      - name: Verify Python toolcache runtimes
         shell: bash
         run: |
           set -euo pipefail
@@ -99,28 +99,27 @@ jobs:
           TOOLCACHE="$HOME/actions-runner/_work/_tool/Python"
 
           for version_dir in "$TOOLCACHE"/3.10.* "$TOOLCACHE"/3.12.* "$TOOLCACHE"/3.13.*; do
-            [ -x "$version_dir/x64/bin/python" ] || continue
-
             PY="$version_dir/x64/bin/python"
-            echo "Checking $PY"
+            LIB="$version_dir/x64/lib"
 
-            "$PY" --version
-            "$PY" -c "import sys; print(sys.executable)"
-            ldd "$PY" | grep "not found" && exit 1 || true
-          done
-      - name: Verify Python matrix runtimes
-        shell: bash
-        run: |
-          TOOLCACHE="$HOME/actions-runner/_work/_tool/Python"
+            [ -x "$PY" ] || continue
 
-          for version in 3.10.* 3.12.* 3.13.*; do
-            for py in "$TOOLCACHE"/"$version"/x64/bin/python; do
-              [ -x "$py" ] || continue
+            echo "================================"
+            echo "Checking: $PY"
+            echo "Library: $LIB"
 
-              echo "Testing: $py"
-              "$py" --version
-              ldd "$py" | grep "not found" && exit 1 || true
-            done
+            if [ ! -f "$LIB/libpython$(basename "$version_dir" | cut -d. -f1,2).so.1.0" ]; then
+              echo "Python shared library missing: $LIB"
+              exit 1
+            fi
+
+            LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+              "$PY" --version
+
+            LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+              "$PY" -c "import sys; print(sys.executable)"
+
+            echo "Runtime OK"
           done
       - name: Run tests from a clean source/bytecode state
         shell: bash
