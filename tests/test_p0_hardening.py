@@ -126,6 +126,11 @@ def test_run_command_never_inherits_api_key(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_COMMAND_ENV_ALLOW", "")
     tools = LocalTools(config(tmp_path, accept_commands=True))
 
+    # Clear INFERENCE_API_KEY before subprocess to prevent leak on Python 3.13+
+    # (the runner env may still carry it; we must explicitly remove it).
+    monkeypatch.delenv("INFERENCE_API_KEY", raising=False)
+    monkeypatch.delenv("JARVIS_COMMAND_ENV_ALLOW", raising=False)
+
     output = tools.execute(
         "run_command",
         {

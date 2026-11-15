@@ -33,11 +33,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Install Python development shared libraries
+        # Needed so that subprocess launched Python can find libpython3.X.so.1.0
+        # (avoids "error while loading shared libraries: libpython3.13.so.1.0"
+        # on self-hosted runners with Python 3.13).
+        run: |
+          python -c "import sys; print(sys.executable)"
+          if [[ "${{ matrix.python-version }}" == "3.13" ]]; then
+            apt-get update && apt-get install -y libpython3.13-dev 2>/dev/null || \
+            apt-get update && apt-get install -y python3.13-dev 2>/dev/null || true
+          fi
       - name: Install Jarvis and development dependencies
         run: python -m pip install --no-cache-dir -e . -r requirements.txt twine
       - name: Verify coordinated Core
         run: |
-          python -c "import importlib.metadata as m; assert m.version('jarvis-agent-core') == '0.17.4'"
+          python -c "import importlib.metadata as m; assert m.version('jarvis-agent-core') == '0.18.0'"
           python -c "from jarvis_core import Capability, CapabilityPolicy, InferenceClient, InferenceClientError, InferenceConfig, SandboxRequirements; assert all((Capability, CapabilityPolicy, InferenceClient, InferenceClientError, InferenceConfig, SandboxRequirements))"
           python -c "from jarvis_core.execution_maturity import Checkpoint, ProcessHandle, SteeringCommand; assert all((Checkpoint, ProcessHandle, SteeringCommand))"
           python -c "from jarvis_core import RouteCalibrator, RouteObservation; assert all((RouteCalibrator, RouteObservation))"
@@ -71,7 +81,7 @@ jobs:
           python -m venv /tmp/jarvis-clean-install
           /tmp/jarvis-clean-install/bin/python -m pip install --no-cache-dir dist/*.whl
           /tmp/jarvis-clean-install/bin/jarvis --version
-          /tmp/jarvis-clean-install/bin/python -c "import importlib.metadata as m; assert m.version('jarvis-agent-core') == '0.17.4'"
+          /tmp/jarvis-clean-install/bin/python -c "import importlib.metadata as m; assert m.version('jarvis-agent-core') == '0.18.0'"
           /tmp/jarvis-clean-install/bin/python -c "from jarvis_cli.sdk import CloudWorker; assert CloudWorker.__name__ == 'FencedCloudWorker'"
       - name: Write commit-bound certification manifest
         if: always()
