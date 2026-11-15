@@ -102,7 +102,12 @@ def install_evidence_v07() -> None:
             if isinstance(result, str)
             else json.dumps(result, ensure_ascii=False, default=str)
         )
-        digest = hashlib.sha256(raw.encode()).hexdigest()
+        # CLI-18: two calls on different inputs can return identical text
+        # (e.g. read_file on two same-content files); dedupe must key on the
+        # call identity as well, or the second result is hidden entirely.
+        identity = local_agent._TOOL_IDENTITY.get()
+        identity_json = json.dumps(identity, sort_keys=True, default=str)
+        digest = hashlib.sha256((identity_json + "\x00" + raw).encode()).hexdigest()
         seen = _DIGESTS.get()
         if seen is not None and digest in seen:
             state = efficiency_runtime._RUN.get()

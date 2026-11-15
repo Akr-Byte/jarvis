@@ -914,15 +914,15 @@ def test_machine_output_never_opens_review_prompt(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["status"] == "awaiting_approval"
 
 
-def test_write_flag_works_before_or_after_run_subcommand():
+def test_write_flag_works_before_or_after_local_subcommand():
     parser = build_parser()
 
-    assert parser.parse_args(["--write", "run", "task"]).write is True
-    assert parser.parse_args(["run", "--write", "task"]).write is True
-    assert parser.parse_args(["run", "--allow-edits", "task"]).write is True
-    assert parser.parse_args(["run", "task"]).write is True
-    assert parser.parse_args(["--read-only", "run", "task"]).write is False
-    assert parser.parse_args(["run", "--read-only", "task"]).write is False
+    assert parser.parse_args(["--write", "local", "task"]).write is True
+    assert parser.parse_args(["local", "--write", "task"]).write is True
+    assert parser.parse_args(["--allow-edits", "local", "task"]).write is True
+    assert parser.parse_args(["local", "task"]).write is True
+    assert parser.parse_args(["--read-only", "local", "task"]).write is False
+    assert parser.parse_args(["local", "--read-only", "task"]).write is False
 
 
 def test_interactive_edit_permission_is_scoped_to_one_task(monkeypatch, capsys):
@@ -948,18 +948,20 @@ def test_edit_prompt_is_limited_to_change_requests(task, expected):
     assert task_requests_edits(task) is expected
 
 
-def test_detach_flag_works_before_or_after_run_subcommand():
+def test_detach_flag_works_before_or_after_local_subcommand():
     parser = build_parser()
 
-    assert parser.parse_args(["--detach", "run", "task"]).detach is True
-    assert parser.parse_args(["run", "--detach", "task"]).detach is True
+    assert parser.parse_args(["--detach", "local", "task"]).detach is True
+    assert parser.parse_args(["local", "--detach", "task"]).detach is True
 
 
-def test_continue_flag_works_before_or_after_run_subcommand():
+def test_continue_flag_removed():
     parser = build_parser()
 
-    assert parser.parse_args(["--continue", "run", "task"]).continue_session is True
-    assert parser.parse_args(["run", "--continue", "task"]).continue_session is True
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--continue", "task"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["local", "--continue", "task"])
 
 
 @pytest.mark.parametrize(
@@ -975,24 +977,32 @@ def test_run_exit_codes_are_script_friendly(status, expected):
     assert run_exit_code({"status": status}) == expected
 
 
-def test_main_rejects_legacy_ai_stack_doctor(monkeypatch, capsys):
+def _assert_bare_task_reaches_local_agent(monkeypatch, capsys, argv):
+    """Removed-command words route to the local agent, not the legacy error."""
+    for name in ("INFERENCE_BASE_URL", "INFERENCE_API_KEY", "JARVIS_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    rc = main(argv)
+    output = capsys.readouterr()
+    assert rc == 1
+    assert "AI Stack remote commands" not in output.err
+    assert "No inference endpoint configured" in output.err
+
+
+def test_main_routes_doctor_word_to_local_agent(monkeypatch, capsys):
     monkeypatch.setenv("AI_STACK_API_KEY", "legacy-secret")
-    assert main(["doctor"]) == 2
-    output = capsys.readouterr()
-    assert "AI Stack remote commands have been removed" in output.err
-    assert output.out == ""
+    _assert_bare_task_reaches_local_agent(monkeypatch, capsys, ["doctor"])
 
 
-def test_main_disables_ai_stack_run_command(capsys):
-    assert main(["run", "review", "the repo"]) == 2
-    output = capsys.readouterr()
-    assert "AI Stack remote commands have been removed" in output.err
-    assert output.out == ""
+def test_main_routes_run_word_to_local_agent(monkeypatch, capsys):
+    _assert_bare_task_reaches_local_agent(
+        monkeypatch, capsys, ["run", "review", "the repo"]
+    )
 
 
-def test_main_shorthand_never_routes_to_ai_stack(capsys):
-    assert main(["run", "fix", "the tests"]) == 2
-    assert "AI Stack remote commands have been removed" in capsys.readouterr().err
+def test_main_shorthand_run_task_never_routes_to_ai_stack(monkeypatch, capsys):
+    _assert_bare_task_reaches_local_agent(
+        monkeypatch, capsys, ["run", "fix", "the tests"]
+    )
 
 
 def test_main_local_stream_simulate_mode(capsys):
@@ -1013,11 +1023,9 @@ def test_main_local_stream_fails_without_inference_endpoint(monkeypatch, capsys)
     assert "Quicksort" not in output.err
 
 
-def test_main_reports_removed_remote_commands_without_traceback(capsys):
-    assert main(["doctor"]) == 2
-    error = capsys.readouterr().err
-    assert "AI Stack remote commands have been removed" in error
-    assert "Traceback" not in error
+def test_main_reports_no_traceback_for_removed_command_words(monkeypatch, capsys):
+    monkeypatch.setenv("AI_STACK_API_KEY", "legacy-secret")
+    _assert_bare_task_reaches_local_agent(monkeypatch, capsys, ["doctor"])
 
 
 def test_main_rejects_server_commands_before_network_access(monkeypatch, capsys):
@@ -1026,8 +1034,7 @@ def test_main_rejects_server_commands_before_network_access(monkeypatch, capsys)
             raise AssertionError("Jarvis must not instantiate the AI Stack client")
 
     monkeypatch.setattr("jarvis_cli.main.AgentClient", ForbiddenClient)
-    assert main(["list"]) == 2
-    assert "AI Stack remote commands have been removed" in capsys.readouterr().err
+    _assert_bare_task_reaches_local_agent(monkeypatch, capsys, ["list"])
 
 
 def test_interactive_shell_automatically_allows_edit_tasks(monkeypatch, capsys):

@@ -61,6 +61,8 @@ def test_resolve_local_config_requires_endpoint_and_key(monkeypatch, tmp_path):
         "JARVIS_BASE_URL",
         "JARVIS_API_KEY",
         "OPENAI_API_KEY",
+        "INFERENCE_BASE_URL",
+        "INFERENCE_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
     args = SimpleNamespace(

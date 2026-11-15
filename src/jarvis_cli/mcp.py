@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import subprocess
 from threading import RLock, Thread
 from time import monotonic
@@ -29,6 +30,34 @@ MAX_MCP_RESPONSE_BYTES = max(
     65_536,
     int(os.getenv("JARVIS_MAX_MCP_RESPONSE_BYTES", "4194304")),
 )
+MAX_MCP_ERROR_BYTES = 4_096
+
+# CLI-14: advertise a real MCP protocol revision and validate the server's
+# response. Streamable-HTTP servers reject requests that skip the handshake.
+MCP_PROTOCOL_VERSION = "2025-06-18"
+_SESSION_ID_PATTERN = re.compile(r"[\x21-\x7e]{1,512}")
+
+
+def _client_info() -> dict[str, Any]:
+    from . import __version__
+
+    return {"name": "jarvis", "version": __version__}
+
+
+def _error_detail(exc: HTTPError) -> str:
+    """Extract a bounded JSON-RPC message from an error response body."""
+    try:
+        payload = json.loads(exc.read(MAX_MCP_ERROR_BYTES).decode("utf-8", "replace"))
+    except Exception:
+        return ""
+    message = ""
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or "")
+        elif isinstance(error, (str, int, float)):
+            message = str(error)
+    return f": {message}" if message else ""
 
 
 class MCPClient:
@@ -49,6 +78,9 @@ class MCPClient:
         self._lock = RLock()
         self._next_id = 0
         self._initialized = False
+        self.protocol_version: str | None = None
+        self.server_info: dict[str, Any] | None = None
+        self.server_capabilities: dict[str, Any] = {}
         self.last_ok: float | None = None
         atexit.register(self.close)
 
@@ -132,14 +164,30 @@ class MCPClient:
         with self._lock:
             if self._initialized:
                 return
-            self._send(
+            result = self._send(
                 "initialize",
                 {
-                    "protocolVersion": "2026-07-28",
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": {"name": "jarvis", "version": "0.8"},
+                    "clientInfo": _client_info(),
                 },
             )
+            # CLI-14: a server that answers initialize without a protocol
+            # version is not speaking MCP; fail loudly instead of proceeding.
+            if not isinstance(result, dict):
+                raise APIError("MCP server returned a non-object initialize result")
+            version = result.get("protocolVersion")
+            if not isinstance(version, str) or not version.strip():
+                raise APIError(
+                    "MCP server returned no protocolVersion during initialize"
+                )
+            self.protocol_version = version
+            capabilities = result.get("capabilities")
+            self.server_capabilities = (
+                capabilities if isinstance(capabilities, dict) else {}
+            )
+            info = result.get("serverInfo")
+            self.server_info = info if isinstance(info, dict) else None
             process = self._start_locked()
             if process.stdin is None:
                 raise APIError("MCP process stdin is unavailable")
@@ -179,6 +227,9 @@ class MCPClient:
             "running": running,
             "last_ok": self.last_ok,
             "command": self.command,
+            "initialized": self._initialized,
+            "protocol_version": self.protocol_version,
+            "server_info": self.server_info,
         }
 
     def close(self) -> None:
@@ -231,54 +282,138 @@ class HTTPMCPClient:
         self._opener = build_opener(_RejectRedirects())
         self._next_id = 0
         self._lock = RLock()
+        self._session_id: str | None = None
+        self._initialized = False
+        self.protocol_version: str | None = None
+        self.server_info: dict[str, Any] | None = None
+        self.server_capabilities: dict[str, Any] = {}
         self.last_ok: float | None = None
+
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if self._session_id:
+            headers["Mcp-Session-Id"] = self._session_id
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    def _post(
+        self, payload: dict[str, Any], *, request_id: int | None
+    ) -> tuple[Any, dict[str, str]]:
+        """POST one JSON-RPC message and return (result, response headers)."""
+        body = json.dumps(payload).encode()
+        try:
+            with self._opener.open(
+                Request(self.endpoint, body, self._headers()), timeout=self.timeout
+            ) as response:
+                raw = response.read(MAX_MCP_RESPONSE_BYTES + 1)
+                response_headers = {
+                    key: value for key, value in response.headers.items()
+                }
+        except HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise APIError("MCP endpoint redirects are forbidden") from exc
+            raise APIError(
+                f"MCP HTTP request failed: {exc.code}{_error_detail(exc)}"
+            ) from exc
+        if len(raw) > MAX_MCP_RESPONSE_BYTES:
+            raise APIError(
+                "MCP HTTP response exceeded the configured "
+                f"{MAX_MCP_RESPONSE_BYTES}-byte safety limit"
+            )
+        if request_id is None:
+            # Notifications may be answered with an empty body (HTTP 202).
+            if not raw.strip():
+                return None, response_headers
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise APIError("MCP endpoint returned invalid JSON") from exc
+        if not isinstance(data, dict):
+            raise APIError("MCP endpoint returned a non-object JSON response")
+        if request_id is not None and data.get("id") not in {None, request_id}:
+            raise APIError("MCP endpoint returned a mismatched JSON-RPC id")
+        if "error" in data:
+            raise APIError(f"MCP error: {data['error']}")
+        if request_id is not None:
+            self.last_ok = monotonic()
+        return data.get("result"), response_headers
+
+    def initialize(self) -> None:
+        """Perform the MCP initialize handshake (CLI-14).
+
+        Real Streamable-HTTP servers reject tools/list and tools/call from
+        clients that never sent `initialize`, and they assign a
+        `Mcp-Session-Id` that must accompany every later request.
+        """
+        with self._lock:
+            if self._initialized:
+                return
+            self._next_id += 1
+            request_id = self._next_id
+            result, response_headers = self._post(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": _client_info(),
+                    },
+                },
+                request_id=request_id,
+            )
+            if not isinstance(result, dict):
+                raise APIError("MCP server returned a non-object initialize result")
+            version = result.get("protocolVersion")
+            if not isinstance(version, str) or not version.strip():
+                raise APIError(
+                    "MCP server returned no protocolVersion during initialize"
+                )
+            self.protocol_version = version
+            capabilities = result.get("capabilities")
+            self.server_capabilities = (
+                capabilities if isinstance(capabilities, dict) else {}
+            )
+            info = result.get("serverInfo")
+            self.server_info = info if isinstance(info, dict) else None
+            session = response_headers.get("Mcp-Session-Id")
+            if session:
+                session = session.strip()
+                if not _SESSION_ID_PATTERN.fullmatch(session):
+                    raise APIError("MCP server returned an invalid Mcp-Session-Id")
+                self._session_id = session
+            self._post(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {},
+                },
+                request_id=None,
+            )
+            self._initialized = True
 
     def _send(self, method: str, params: dict[str, Any] | None = None) -> Any:
         with self._lock:
             self._next_id += 1
             request_id = self._next_id
-            body = json.dumps(
+            result, _ = self._post(
                 {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "method": method,
                     "params": params or {},
-                }
-            ).encode()
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            }
-            if self.token:
-                headers["Authorization"] = f"Bearer {self.token}"
-            try:
-                with self._opener.open(
-                    Request(self.endpoint, body, headers), timeout=self.timeout
-                ) as response:
-                    raw = response.read(MAX_MCP_RESPONSE_BYTES + 1)
-            except HTTPError as exc:
-                if 300 <= exc.code < 400:
-                    raise APIError("MCP endpoint redirects are forbidden") from exc
-                raise APIError(f"MCP HTTP request failed: {exc.code}") from exc
-            if len(raw) > MAX_MCP_RESPONSE_BYTES:
-                raise APIError(
-                    "MCP HTTP response exceeded the configured "
-                    f"{MAX_MCP_RESPONSE_BYTES}-byte safety limit"
-                )
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise APIError("MCP endpoint returned invalid JSON") from exc
-            if not isinstance(payload, dict):
-                raise APIError("MCP endpoint returned a non-object JSON response")
-            if payload.get("id") not in {None, request_id}:
-                raise APIError("MCP endpoint returned a mismatched JSON-RPC id")
-            if "error" in payload:
-                raise APIError(f"MCP error: {payload['error']}")
-            self.last_ok = monotonic()
-            return payload.get("result")
+                },
+                request_id=request_id,
+            )
+            return result
 
     def list_tools(self) -> list[dict[str, Any]]:
+        self.initialize()
         return list((self._send("tools/list") or {}).get("tools") or [])
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
@@ -290,6 +425,7 @@ class HTTPMCPClient:
                 f"MCP tool requires approval: {name}. "
                 "Use authorize_mcp_call() or configure approval in MCP policy."
             )
+        self.initialize()
         return self._send("tools/call", {"name": name, "arguments": arguments})
 
     def health(self) -> dict[str, Any]:
@@ -297,6 +433,10 @@ class HTTPMCPClient:
             "running": True,
             "last_ok": self.last_ok,
             "endpoint": self.endpoint,
+            "initialized": self._initialized,
+            "protocol_version": self.protocol_version,
+            "server_info": self.server_info,
+            "session": self._session_id is not None,
         }
 
 

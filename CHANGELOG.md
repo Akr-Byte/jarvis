@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+### World-class hardening (P0.6)
+
+- **MCP handshake (CLI-14)**: `HTTPMCPClient` now performs the real MCP
+  `initialize` handshake (protocol revision `2025-06-18`, clientInfo carrying
+  the actual jarvis version), records the negotiated `protocolVersion`,
+  serverInfo and capabilities, validates and tracks the `Mcp-Session-Id`
+  response header (bounded, printable-ASCII), and sends it on every later
+  request — real Streamable-HTTP servers rejected the old session-less
+  client. The id-less `notifications/initialized` notification is sent after
+  the handshake. stdio `initialize` validates the result object and records
+  the negotiated protocol version instead of blindly proceeding. HTTP
+  permission/approval enforcement is unchanged. HTTP error responses now
+  surface the server's bounded JSON-RPC error message.
+- **SIGTERM durability (CLI-15)**: `jarvis local` and `session-resume` now
+  install the SIGTERM/SIGHUP → KeyboardInterrupt conversion. A terminated run
+  writes its trace and marks the session `failed` instead of leaving a zombie
+  `running` session behind, and exits with the script-friendly code 130.
+- **Patch approval shows the diff (CLI-12)**: the approval prompt now embeds
+  the exact patch that would be applied (bounded at 8,000 characters with an
+  explicit truncation marker) — approving is no longer blind.
+- **Undo patch stack (CLI-12)**: every applied patch is kept under
+  `git rev-parse --git-path jarvis-patches` as a numbered stack (`001.patch`,
+  newest index last). `jarvis undo` reverses and pops the newest patch and
+  reports how many earlier patches remain undoable; a follow-up `jarvis undo`
+  walks further back. Legacy workspaces holding a single `jarvis-last.patch`
+  still undo once (backward compatible), and the unsafe-undo guard is
+  unchanged.
+- **Identity-scoped dedupe (CLI-18)**: tool-result dedupe (evidence and
+  efficiency layers) now keys its digest on the tool call identity (tool name
+  + arguments) as well as the result text, so two `read_file` calls on
+  different same-content files are no longer collapsed — the second path is
+  no longer hidden from the model.
+- **Routing cleanup (CLI-19)**: the removed AI Stack run-management words
+  (`run`, `list`, `show`, `resume`, `approve`, `discard`, `cancel`,
+  `projects`, `workspaces`, `doctor`) were dropped from `CLI_COMMANDS` and
+  their dead subparsers and error block deleted; a bare task starting with one
+  of those words now routes to the local agent instead of dying with the
+  misleading "AI Stack remote commands have been removed" error. The unused
+  top-level `--continue` flag is gone, and `local` regained the
+  `--write/--allow-edits` and `--detach` flags (with `argparse.SUPPRESS`
+  defaults so subparser defaults cannot clobber top-level values).
+- Fixed a flaky `test_resolve_local_config_requires_endpoint_and_key` that
+  leaked `INFERENCE_BASE_URL`/`INFERENCE_API_KEY` from ambient env.
+- New test battery `tests/test_p06_world_class.py`: 13 tests including a
+  scripted Streamable-HTTP server double, a real stdio MCP server, real
+  SIGTERM delivery, and git-backed patch-stack undo tests.
+
 ## 0.12.5
 
 ### Agent loop hardening

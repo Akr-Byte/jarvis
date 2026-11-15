@@ -64,50 +64,48 @@ TERMINAL_STATUSES = {
 
 
 CLI_COMMANDS = {
-    "approve",
+    # Real local and platform subcommands (kept so bare tasks never shadow
+    # them), plus names of removed AI Stack commands that v08_main still
+    # rejects with its own clear message ("cloud").
     "browser",
     "calibrate",
-    "cancel",
     "cloud",
     "dashboard",
-    "discard",
-    "doctor",
-    "local",
-    "model-doctor",
-    "models",
-    "mcp-tools",
     "eval",
     "hooks",
     "ide",
     "jobs",
-    "list",
+    "local",
+    "model-doctor",
+    "models",
+    "mcp-tools",
     "plan",
     "permissions",
     "plugin",
     "proof",
     "repo-map",
-    "session-show",
     "self-update",
     "session-resume",
     "session-fork",
     "session-rename",
     "session-archive",
     "sessions",
+    "session-show",
     "skills",
     "team",
     "trace",
+    "trust",
     "tui",
     "undo",
     "web-search",
-    "projects",
-    "bench",
-    "optimize",
-    "resume",
-    "run",
-    "show",
     "stream",
-    "workspaces",
 }
+
+# CLI-19: the AI Stack run-management words ("run", "list", "show", "resume",
+# "approve", "discard", "cancel", "projects", "workspaces", "doctor") are
+# deliberately NOT in CLI_COMMANDS. Their subcommands were removed, so a bare
+# task starting with one of those words now routes to the local agent instead
+# of dying with the misleading "AI Stack remote commands" error.
 
 
 SHELL_COMMANDS = (
@@ -737,56 +735,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Let active runs continue after this client exits",
     )
-    parser.add_argument(
-        "--continue",
-        dest="continue_session",
-        action="store_true",
-        help="Continue the latest conversation in the selected workspace",
-    )
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command")
-
-    run = subparsers.add_parser("run", help="Start a task and stream its progress")
-    run.add_argument("task", nargs="+", help="Task text, or - to read stdin")
-    run.add_argument(
-        "--output",
-        choices=("text", "json", "stream-json"),
-        default="text",
-    )
-    run.add_argument("--conversation", help="Conversation ID for a follow-up")
-    run.add_argument(
-        "--continue",
-        dest="continue_session",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Continue the latest conversation in the selected workspace",
-    )
-    run.add_argument(
-        "--no-review",
-        action="store_true",
-        help="Leave pending changes for later instead of auto-applying them",
-    )
-    run.add_argument(
-        "--allow-edits",
-        "--write",
-        dest="write",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Automatically apply edits (default)",
-    )
-    run.add_argument(
-        "--read-only",
-        dest="write",
-        action="store_false",
-        default=argparse.SUPPRESS,
-        help="Disable workspace edits",
-    )
-    run.add_argument(
-        "--detach",
-        action="store_true",
-        default=argparse.SUPPRESS,
-        help="Let the run continue after this client exits",
-    )
 
     local = subparsers.add_parser(
         "local",
@@ -825,10 +775,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run allowlisted commands without an interactive prompt",
     )
     local.add_argument(
+        "--detach",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Let active runs continue after this client exits",
+    )
+    local.add_argument(
+        "--allow-edits",
+        "--write",
+        dest="write",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Automatically apply model-proposed patches (default)",
+    )
+    local.add_argument(
         "--read-only",
         dest="write",
         action="store_false",
-        default=True,
+        default=argparse.SUPPRESS,
         help="Disable the local patch tool",
     )
 
@@ -943,18 +907,6 @@ def build_parser() -> argparse.ArgumentParser:
         write=False,
     )
 
-    listing = subparsers.add_parser("list", help="List recent runs")
-    listing.add_argument("--limit", type=int, default=20)
-    show = subparsers.add_parser("show", help="Show one run")
-    show.add_argument("run_id")
-    resume = subparsers.add_parser("resume", help="Replay or follow one run")
-    resume.add_argument("run_id")
-    for action in ("approve", "discard", "cancel"):
-        action_parser = subparsers.add_parser(action, help=f"{action.title()} a run")
-        action_parser.add_argument("run_id")
-    subparsers.add_parser("projects", help="List configured projects")
-    subparsers.add_parser("workspaces", help="List agent workspaces")
-    subparsers.add_parser("doctor", help="Check API access and workspace mapping")
     return parser
 
 
@@ -965,24 +917,6 @@ def main(argv: list[str] | None = None) -> int:
         argv = ["local"]
     argv = normalize_argv(argv, CLI_COMMANDS)
     args = build_parser().parse_args(argv)
-    if args.command in {
-        "run",
-        "list",
-        "show",
-        "resume",
-        "approve",
-        "discard",
-        "cancel",
-        "projects",
-        "workspaces",
-        "doctor",
-    }:
-        print(
-            "Error: AI Stack remote commands have been removed. "
-            "Jarvis runs locally and connects directly to jarvis-inference.",
-            file=sys.stderr,
-        )
-        return 2
     if args.command == "self-update":
         try:
             from .update import update_binary
@@ -1025,13 +959,20 @@ def main(argv: list[str] | None = None) -> int:
                 task = sys.stdin.read().strip()
             if not task:
                 raise APIError("A follow-up task is required")
-            result = run_local_agent(
-                task,
-                config,
-                tools=LocalTools(config, approval=interactive_approval),
-                initial_messages=messages,
-                checkpoint=lambda value: store.checkpoint(session.id, value),
-            )
+            # CLI-15: a terminated resume must not leave the session stuck in
+            # 'running' (resolve_approval sets that status for resumed runs).
+            with cancellation_signals():
+                try:
+                    result = run_local_agent(
+                        task,
+                        config,
+                        tools=LocalTools(config, approval=interactive_approval),
+                        initial_messages=messages,
+                        checkpoint=lambda value: store.checkpoint(session.id, value),
+                    )
+                except BaseException as exc:
+                    store.finish(session.id, result=str(exc), status="failed")
+                    raise
             store.finish(session.id, result=result)
             print(result)
             return 0
@@ -1071,24 +1012,28 @@ def main(argv: list[str] | None = None) -> int:
             )
             trace = TraceRecorder()
             trace_path = store.path.parent / "traces" / f"{session.id}.jsonl"
-            try:
-                result = run_local_agent(
-                    task,
-                    config,
-                    tools=tools,
-                    trace=trace,
-                    checkpoint=lambda value: store.checkpoint(session.id, value),
-                )
-            except BaseException as exc:
-                trace.record("session_failed", error=str(exc))
-                trace.write_jsonl(trace_path)
-                store.finish(
-                    session.id,
-                    result=str(exc),
-                    status="failed",
-                    trace_path=str(trace_path),
-                )
-                raise
+            # CLI-15: convert SIGTERM/SIGHUP into the normal cancellation path
+            # so a killed `jarvis local` run is recorded as failed instead of
+            # leaving a zombie 'running' session behind.
+            with cancellation_signals():
+                try:
+                    result = run_local_agent(
+                        task,
+                        config,
+                        tools=tools,
+                        trace=trace,
+                        checkpoint=lambda value: store.checkpoint(session.id, value),
+                    )
+                except BaseException as exc:
+                    trace.record("session_failed", error=str(exc))
+                    trace.write_jsonl(trace_path)
+                    store.finish(
+                        session.id,
+                        result=str(exc),
+                        status="failed",
+                        trace_path=str(trace_path),
+                    )
+                    raise
             trace.record("session_completed")
             trace.write_jsonl(trace_path)
             store.finish(
