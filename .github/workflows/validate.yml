@@ -89,7 +89,8 @@ jobs:
               echo "Python $version PASSED"
             done
           done
-          - name: Install Jarvis and development dependencies
+          
+      - name: Install Jarvis and development dependencies
         run: python -m pip install --no-cache-dir -e . -r requirements.txt twine
       - name: Verify coordinated Core
         run: |
