@@ -241,7 +241,7 @@ def test_patch_approval_prompt_contains_the_diff(monkeypatch, tmp_path):
     monkeypatch.setattr(
         tools,
         "_patch_stack",
-        lambda: None,
+        lambda: tmp_path / "patches",
         raising=False,
     )
     runs = {

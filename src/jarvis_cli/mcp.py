@@ -252,6 +252,43 @@ class _RejectRedirects(HTTPRedirectHandler):
         raise APIError(f"MCP endpoint redirects are forbidden ({code} to {newurl})")
 
 
+def _sse_payload(raw: bytes) -> dict[str, Any] | None:
+    """Return the last complete JSON-RPC object carried by an SSE stream.
+
+    Streamable-HTTP MCP servers may answer a POST with
+    `text/event-stream` (that is why the client advertises it in `Accept`).
+    The response for one request is a small event stream whose `data:` lines
+    hold JSON-RPC messages.
+    """
+    text = raw.decode("utf-8", "replace")
+    pending: list[str] = []
+    payload: dict[str, Any] | None = None
+
+    def flush() -> None:
+        nonlocal payload
+        if not pending:
+            return
+        try:
+            decoded = json.loads("\n".join(pending))
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, dict):
+            payload = decoded
+        pending.clear()
+
+    for line in text.splitlines():
+        if not line.strip():
+            flush()
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        if field == "data":
+            pending.append(value[1:] if value.startswith(" ") else value)
+    flush()
+    return payload
+
+
 class HTTPMCPClient:
     def __init__(
         self,
@@ -292,8 +329,12 @@ class HTTPMCPClient:
     def _headers(self) -> dict[str, str]:
         headers = {
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            # Streamable-HTTP servers require the client to accept both the
+            # plain JSON and the SSE streaming shape (P07).
+            "Accept": "application/json, text/event-stream",
         }
+        if self.protocol_version:
+            headers["MCP-Protocol-Version"] = self.protocol_version
         if self._session_id:
             headers["Mcp-Session-Id"] = self._session_id
         if self.token:
@@ -324,14 +365,29 @@ class HTTPMCPClient:
                 "MCP HTTP response exceeded the configured "
                 f"{MAX_MCP_RESPONSE_BYTES}-byte safety limit"
             )
-        if request_id is None:
-            # Notifications may be answered with an empty body (HTTP 202).
-            if not raw.strip():
-                return None, response_headers
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise APIError("MCP endpoint returned invalid JSON") from exc
+        content_type = next(
+            (
+                value
+                for key, value in response_headers.items()
+                if key.casefold() == "content-type"
+            ),
+            "",
+        )
+        if content_type.split(";", 1)[0].strip().casefold() == "text/event-stream":
+            data = _sse_payload(raw)
+            if data is None:
+                if request_id is None and not raw.strip():
+                    return None, response_headers
+                raise APIError("MCP endpoint returned an empty SSE event stream")
+        else:
+            if request_id is None:
+                # Notifications may be answered with an empty body (HTTP 202).
+                if not raw.strip():
+                    return None, response_headers
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise APIError("MCP endpoint returned invalid JSON") from exc
         if not isinstance(data, dict):
             raise APIError("MCP endpoint returned a non-object JSON response")
         if request_id is not None and data.get("id") not in {None, request_id}:
@@ -438,6 +494,26 @@ class HTTPMCPClient:
             "server_info": self.server_info,
             "session": self._session_id is not None,
         }
+
+    def close(self) -> None:
+        """Terminate the server-side session (Streamable HTTP `DELETE`).
+
+        Best effort: servers that never assigned a session id, or that reject
+        `DELETE`, must not turn shutdown into an error.
+        """
+        with self._lock:
+            headers = self._headers()
+            session = self._session_id
+            self._session_id = None
+            self._initialized = False
+        if not session:
+            return
+        try:
+            request = Request(self.endpoint, None, headers, method="DELETE")
+            with self._opener.open(request, timeout=min(self.timeout, 5)):
+                pass
+        except (OSError, ValueError):
+            pass
 
 
 def default_mcp_config_path() -> Path:

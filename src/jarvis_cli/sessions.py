@@ -36,14 +36,55 @@ class LocalSession:
     archived_at: str | None = None
 
 
+_EVIDENCE_FOOTER = "\n\nEfficiency/evidence:"
+
+
+def _clean_assistant_answer(result: str) -> str:
+    """Drop the CLI's machine-readable evidence footer from the transcript.
+
+    The footer is useful when a human reads the answer, but persisting it as
+    an assistant turn means the next `session-resume` replays it to the model,
+    bloating the prompt (and, with small local models, teaching them to emit
+    the same footer). Only the human-readable answer is durable (P07).
+    """
+    marker = result.find(_EVIDENCE_FOOTER)
+    if marker != -1:
+        result = result[:marker]
+    return result.rstrip()
+
+
+def _restrict_mode(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
 class SessionStore:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else default_session_db()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        created = not self.path.parent.exists()
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if created:
+            # `mkdir(mode=...)` is subject to the umask, so tighten the
+            # freshly created state directory explicitly (P07).
+            _restrict_mode(self.path.parent, 0o700)
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
         self._migrate()
+        self._restrict_permissions()
+
+    def _restrict_permissions(self) -> None:
+        """Session transcripts contain prompts and file contents (P07).
+
+        The database (plus its WAL/SHM siblings) is created 0600 so another
+        local user cannot read a session transcript or pending approvals.
+        """
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{self.path}{suffix}")
+            if candidate.exists():
+                _restrict_mode(candidate, 0o600)
 
     def _migrate(self) -> None:
         self.connection.executescript("""
@@ -96,6 +137,19 @@ class SessionStore:
                     f"ALTER TABLE sessions ADD COLUMN {name} {sql_type}"
                 )
         self.connection.commit()
+
+    def session_metadata(self, session_id: str) -> dict[str, Any]:
+        """Session-level metadata (e.g. whether the run was read-only)."""
+        row = self.connection.execute(
+            "SELECT metadata FROM sessions WHERE id=?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return {}
+        try:
+            value = json.loads(row["metadata"])
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
 
     def create(
         self,
@@ -294,6 +348,8 @@ class SessionStore:
             workspace=source.workspace,
             task=source.task,
             model=source.model,
+            # A fork of a read-only session stays read-only (P07).
+            metadata=self.session_metadata(source.id),
             name=name,
             parent_id=source.id,
         )
@@ -337,12 +393,18 @@ class SessionStore:
             "UPDATE sessions SET status=?, result=?, trace_path=?, updated_at=? WHERE id=?",
             (status, result, trace_path, now, target.id),
         )
-        transcript = self.transcript(target.id)
-        if not transcript or not (
-            transcript[-1].get("role") == "assistant"
-            and transcript[-1].get("content") == result
-        ):
-            self.append_message(target.id, "assistant", result)
+        # Only a successful run produces an assistant turn. Persisting the
+        # error text of a failed run made `session-resume` replay
+        # "Error: ..." to the model as if it had said it (P07).
+        if status == "completed":
+            answer = _clean_assistant_answer(result)
+            transcript = self.transcript(target.id)
+            if answer and not (
+                transcript
+                and transcript[-1].get("role") == "assistant"
+                and transcript[-1].get("content") == answer
+            ):
+                self.append_message(target.id, "assistant", answer)
         self.connection.commit()
         return self.get(target.id)
 

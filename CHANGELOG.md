@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.12.7
+
+### World-class hardening (P0.7)
+
+- **Project `.env` is no longer auto-loaded before workspace trust (R-1)**:
+  only the global files (`~/.jarvis/.env`, `$JARVIS_GLOBAL_ENV`) load at
+  import; a repository's `.env` is parsed after the trust decision and only
+  for a trusted workspace. `JARVIS_TRUST_WORKSPACE`, `JARVIS_SANDBOX`,
+  `JARVIS_NETWORK`, `JARVIS_GLOBAL_ENV`, `INFERENCE_BASE_URL` and
+  `INFERENCE_API_KEY` are always ignored from a project file, and `.env`
+  participates in the trust digest (`TRUST_VERSION` 5), so committing it
+  invalidates an existing grant.
+- **Completion evidence gate is advisory by default (R-2)**: a run that makes
+  no tool call no longer fails with "Completion evidence gate failed" and
+  loses the model's answer; missing evidence is recorded as
+  `completed_with_warnings`. Test proofs are only required when the task asks
+  for tests/verification. `JARVIS_PROOF_GATE=strict` restores hard failure.
+- **`jarvis undo` works**: the `undo` subcommand is now parsed (it was only
+  documented), and non-Git workspaces keep a durable undo stack under
+  `.jarvis/patches` instead of receiving patches with a false "undo is
+  available" message.
+- **Patch guard accepts legitimate new files**: creation requests may add new
+  files anywhere inside the workspace (root `Makefile`/`hello.txt`, ...);
+  `.git/`, `.jarvis/` and `.env*` remain protected.
+- **`search_text` option injection (CLI-18)**: `rg` is invoked with `--`
+  before the model-supplied pattern, so a pattern such as `--pre=…` is
+  searched literally instead of executed.
+- **Session transcripts**: failed runs no longer persist their error text as
+  an assistant turn, the machine-readable `Efficiency/evidence` footer is
+  stripped before it is stored, and the database (plus WAL/SHM) is created
+  `0600` in a `0700` state directory.
+- **`session-resume` preserves the edit mode**: read-only sessions stay
+  read-only unless `--write` is passed, and `--read-only` downgrades a
+  writable session. `session-fork` inherits the mode.
+- **`session-resume` Ctrl-C** exits 130 without a traceback, matching `local`.
+- **Sandbox `allowlist` fails loudly**: the OS sandbox cannot filter hosts, so
+  the mode is rejected with an explanatory error instead of silently behaving
+  like `deny`.
+- **MCP Streamable HTTP**: requests advertise
+  `Accept: application/json, text/event-stream`, parse SSE responses, send the
+  negotiated `MCP-Protocol-Version`, and `close()` deletes the server-side
+  session.
+- **Numeric env defaults**: an invalid `JARVIS_MAX_STEPS`/`JARVIS_TIMEOUT`
+  reports a clear error instead of a traceback.
+
 ## Unreleased
 
 ### Patch release 0.12.6

@@ -860,6 +860,10 @@ class LocalTools:
                     "--hidden",
                     "--glob",
                     "!.git",
+                    # `--` terminates option parsing so a model-supplied
+                    # pattern such as `--pre=<command>` is searched literally
+                    # instead of executed by ripgrep (CLI-18).
+                    "--",
                     str(arguments["pattern"]),
                     str(path),
                 ]
@@ -996,40 +1000,26 @@ class LocalTools:
         if applied.returncode:
             raise APIError(f"Patch application failed: {applied.stderr.strip()}")
         stack = self._patch_stack()
-        if stack is not None:
-            # CLI-12: keep every applied patch, not just the last one, so
-            # `jarvis undo` can walk back through successive applies.
-            try:
-                stack.mkdir(parents=True, exist_ok=True)
-                index = 1 + max(
-                    (int(p.stem) for p in stack.glob("*.patch") if p.stem.isdigit()),
-                    default=0,
-                )
-                (stack / f"{index:03d}.patch").write_text(patch, encoding="utf-8")
-            except OSError:
-                pass
+        # CLI-12: keep every applied patch, not just the last one, so
+        # `jarvis undo` can walk back through successive applies.
+        try:
+            stack.mkdir(parents=True, exist_ok=True)
+            index = 1 + max(
+                (int(p.stem) for p in stack.glob("*.patch") if p.stem.isdigit()),
+                default=0,
+            )
+            (stack / f"{index:03d}.patch").write_text(patch, encoding="utf-8")
+        except OSError:
+            pass
         return (
             "Patch applied transactionally. Inspect with git_diff and run relevant "
             "tests. Use 'jarvis undo' to reverse this patch unless the workspace "
             "changed since; older patches remain undoable in order."
         )
 
-    def _patch_stack(self) -> Path | None:
+    def _patch_stack(self) -> Path:
         """Directory holding the applied-patch stack (newest index last)."""
-        metadata = subprocess.run(
-            ["git", "rev-parse", "--git-path", "jarvis-patches"],
-            cwd=self.root,
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-        if metadata.returncode:
-            return None
-        path = Path(metadata.stdout.strip())
-        if not path.is_absolute():
-            path = self.root / path
-        return path
+        return _workspace_patch_stack(self.root)
 
 
 def _instructions(root: Path) -> str:
@@ -1716,7 +1706,14 @@ def run_local_agent(
     )
 
 
-def _workspace_patch_stack(workspace: str | Path) -> Path | None:
+def _workspace_patch_stack(workspace: str | Path) -> Path:
+    """Directory holding applied patches (newest index last).
+
+    Inside a Git repository the stack lives under the Git directory so it
+    never shows up in `git status`. A non-Git workspace previously had no
+    undo history at all, while the tool still claimed undo was available; it
+    now gets a durable stack under `<workspace>/.jarvis/patches` (P07).
+    """
     root = Path(workspace).expanduser().resolve()
     metadata = subprocess.run(
         ["git", "rev-parse", "--git-path", "jarvis-patches"],
@@ -1727,7 +1724,7 @@ def _workspace_patch_stack(workspace: str | Path) -> Path | None:
         check=False,
     )
     if metadata.returncode:
-        return None
+        return root / ".jarvis" / "patches"
     path = Path(metadata.stdout.strip())
     if not path.is_absolute():
         path = root / path
@@ -1765,24 +1762,11 @@ def _reverse_patch(root: Path, patch: str, *, flag: str = "--reverse") -> None:
 def undo_last_patch(workspace: str | Path) -> str:
     """Reverse the most recent Jarvis patch (CLI-12: patches form a stack)."""
     root = Path(workspace).expanduser().resolve()
-    metadata = subprocess.run(
-        ["git", "rev-parse", "--git-path", "jarvis-last.patch"],
-        cwd=root,
-        text=True,
-        capture_output=True,
-        timeout=10,
-        check=False,
-    )
-    if metadata.returncode:
-        raise APIError("Workspace is not a Git repository.")
-
     stack = _workspace_patch_stack(root)
-    stack_files: list[Path] = []
-    if stack is not None:
-        stack_files = sorted(
-            (p for p in stack.glob("*.patch") if p.stem.isdigit()),
-            key=lambda p: int(p.stem),
-        )
+    stack_files = sorted(
+        (p for p in stack.glob("*.patch") if p.stem.isdigit()),
+        key=lambda p: int(p.stem),
+    )
 
     if stack_files:
         # Newest index last; reverse the newest, pop it, keep older ones so a
@@ -1796,15 +1780,24 @@ def undo_last_patch(workspace: str | Path) -> str:
         return f"The most recent Jarvis patch was reversed.{suffix}"
 
     # Backward compatibility: single-patch workspaces predating the stack.
-    legacy = Path(metadata.stdout.strip())
-    if not legacy.is_absolute():
-        legacy = root / legacy
-    if not legacy.is_file():
-        raise APIError("No Jarvis patch is available to undo.")
-    patch = legacy.read_text(encoding="utf-8")
-    _reverse_patch(root, patch)
-    legacy.unlink(missing_ok=True)
-    return "The most recent Jarvis patch was reversed."
+    metadata = subprocess.run(
+        ["git", "rev-parse", "--git-path", "jarvis-last.patch"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    if metadata.returncode == 0:
+        legacy = Path(metadata.stdout.strip())
+        if not legacy.is_absolute():
+            legacy = root / legacy
+        if legacy.is_file():
+            patch = legacy.read_text(encoding="utf-8")
+            _reverse_patch(root, patch)
+            legacy.unlink(missing_ok=True)
+            return "The most recent Jarvis patch was reversed."
+    raise APIError("No Jarvis patch is available to undo.")
 
 
 def interactive_approval(description: str) -> bool:

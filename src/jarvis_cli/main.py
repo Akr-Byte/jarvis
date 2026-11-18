@@ -22,37 +22,91 @@ from . import __version__
 from .client import AgentClient, APIError
 from .render import EventRenderer
 
-# Auto-source .env from CWD (if present), so callers don't need to export
-# every variable manually. Also checks ~/.jarvis/.env and $JARVIS_GLOBAL_ENV.
-# Format: KEY=VALUE one per line; blank lines and # comments ignored.
-# Process-environment values always take precedence over CWD/global values,
-# allowing overrides.
-_env_paths = [Path.cwd() / ".env"]
-_home_jarvis_env = Path.home() / ".jarvis" / ".env"
-if _home_jarvis_env.exists():
-    _env_paths.insert(1, _home_jarvis_env)
-_jars_env = os.getenv("JARVIS_GLOBAL_ENV")
-if _jars_env and Path(_jars_env).exists():
-    _env_paths.insert(1, Path(_jars_env))
-for _env_path in _env_paths:
+# Auto-source .env files so callers don't need to export every variable
+# manually. The global files (~/.jarvis/.env and $JARVIS_GLOBAL_ENV) load at
+# import time; the project `<cwd>/.env` deliberately does NOT (see
+# load_project_env). Format: KEY=VALUE one per line; blank lines and #
+# comments ignored. Process-environment values always take precedence over
+# file values, allowing overrides.
+#
+# P07: a project .env is executable configuration owned by the repository.
+# It is only parsed after workspace trust has been computed, and even then a
+# denylist of security-critical keys is skipped, so a hostile repository's
+# .env can neither grant trust, disable isolation, redirect the inference
+# endpoint, nor chain-load another env file.
+_PROJECT_ENV_DENYLIST = frozenset(
+    {
+        "JARVIS_TRUST_WORKSPACE",
+        "JARVIS_SANDBOX",
+        "JARVIS_NETWORK",
+        "JARVIS_GLOBAL_ENV",
+        "INFERENCE_BASE_URL",
+        "INFERENCE_API_KEY",
+    }
+)
+
+
+def _parse_env_file(path: Path, *, denylist: frozenset[str] | None = None) -> None:
+    """Apply KEY=VALUE pairs from ``path`` without overriding the process env."""
+
+    with path.open() as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            # Optional shell prefix (`export KEY=value`).
+            if key.startswith("export "):
+                key = key[len("export ") :].strip()
+            value = value.strip()
+            # Strip one matching pair of surrounding quotes so a quoted
+            # INFERENCE_API_KEY does not silently break auth (CLI-8).
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            if key and (denylist is None or key not in denylist):
+                os.environ.setdefault(key, value)
+
+
+def _global_env_paths() -> list[Path]:
+    paths: list[Path] = []
+    home_jarvis_env = Path.home() / ".jarvis" / ".env"
+    if home_jarvis_env.exists():
+        paths.append(home_jarvis_env)
+    configured = os.getenv("JARVIS_GLOBAL_ENV")
+    if configured and Path(configured).exists():
+        paths.append(Path(configured))
+    return paths
+
+
+for _env_path in _global_env_paths():
     if _env_path.exists():
-        with _env_path.open() as _f:
-            for _line in _f:
-                _line = _line.strip()
-                if not _line or _line.startswith("#") or "=" not in _line:
-                    continue
-                _key, _, _val = _line.partition("=")
-                _key = _key.strip()
-                # Optional shell prefix (`export KEY=value`).
-                if _key.startswith("export "):
-                    _key = _key[len("export ") :].strip()
-                _val = _val.strip()
-                # Strip one matching pair of surrounding quotes so a quoted
-                # INFERENCE_API_KEY does not silently break auth (CLI-8).
-                if len(_val) >= 2 and _val[0] == _val[-1] and _val[0] in {"'", '"'}:
-                    _val = _val[1:-1]
-                if _key:
-                    os.environ.setdefault(_key, _val)
+        _parse_env_file(_env_path)
+
+
+def load_project_env(workspace: str | Path | None = None) -> bool:
+    """Parse ``<workspace>/.env`` only after workspace trust is computed.
+
+    Workspace trust is evaluated BEFORE a single project .env value enters
+    os.environ, so a hostile repository's .env cannot influence the trust
+    decision (P07). Security-critical keys are skipped even for trusted
+    workspaces; the process environment always wins.
+    """
+
+    from .workspace_trust import is_workspace_trusted
+
+    root = Path(workspace or Path.cwd()).expanduser().resolve()
+    # The trust decision must happen first, and it must actually gate the
+    # load: an untrusted repository's .env is never parsed, so it cannot
+    # grant trust, disable the sandbox, or redirect the inference endpoint.
+    if not is_workspace_trusted(root):
+        return False
+    project_env = root / ".env"
+    if not project_env.is_file():
+        return False
+    _parse_env_file(project_env, denylist=_PROJECT_ENV_DENYLIST)
+    return True
+
 
 TERMINAL_STATUSES = {
     "awaiting_approval",
@@ -706,6 +760,30 @@ def normalize_argv(argv: list[str], commands: set[str]) -> list[str]:
     return argv
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(
+            f"Error: environment variable {name} must be an integer (got {raw!r})"
+        ) from None
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise SystemExit(
+            f"Error: environment variable {name} must be a number (got {raw!r})"
+        ) from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jarvis",
@@ -754,7 +832,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Attach one bounded workspace-relative text file; repeat as needed",
     )
     local.add_argument(
-        "--max-steps", type=int, default=int(os.getenv("JARVIS_MAX_STEPS", "30"))
+        "--max-steps", type=int, default=_env_int("JARVIS_MAX_STEPS", 30)
     )
     local.add_argument(
         "--multi-agent",
@@ -762,7 +840,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use selective Explorer, Implementer, and Verifier roles",
     )
     local.add_argument(
-        "--timeout", type=float, default=float(os.getenv("JARVIS_TIMEOUT", "180"))
+        "--timeout", type=float, default=_env_float("JARVIS_TIMEOUT", 180)
     )
     local.add_argument(
         "--accept-edits",
@@ -860,7 +938,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resume even if the session is still marked 'running'",
     )
-    local_resume.set_defaults(write=True, multi_agent=False)
+    local_resume.add_argument(
+        "--write",
+        dest="write",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Allow edits even if the session was created read-only",
+    )
+    local_resume.add_argument(
+        "--read-only",
+        dest="write",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="Resume read-only even if the session was created writable",
+    )
+    # `None` means "not specified": resume then restores the recorded mode.
+    local_resume.set_defaults(multi_agent=False, write=None)
     local_fork = subparsers.add_parser("session-fork", help="Fork a local session")
     local_fork.add_argument("session_id")
     local_fork.add_argument("--name")
@@ -878,6 +971,8 @@ def build_parser() -> argparse.ArgumentParser:
         "repo-map", help="Build an incremental repository map"
     )
     repo_map.add_argument("--workspace", dest="local_workspace")
+    undo = subparsers.add_parser("undo", help="Undo the most recently applied patch")
+    undo.add_argument("--workspace", dest="local_workspace")
     models = subparsers.add_parser("models", help="List and route named model profiles")
     models.add_argument("--require", action="append", default=[])
     web_search = subparsers.add_parser(
@@ -917,6 +1012,14 @@ def main(argv: list[str] | None = None) -> int:
         argv = ["local"]
     argv = normalize_argv(argv, CLI_COMMANDS)
     args = build_parser().parse_args(argv)
+    # P07: a project .env is executable configuration owned by the repository,
+    # so it is parsed only after the workspace-trust decision and only for a
+    # trusted workspace (see load_project_env). It never participates in that
+    # decision and security-critical keys are always ignored.
+    try:
+        load_project_env(getattr(args, "local_workspace", None) or Path.cwd())
+    except OSError:
+        pass
     if args.command == "self-update":
         try:
             from .update import update_binary
@@ -953,6 +1056,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.local_workspace = session.workspace
             if not args.model:
                 args.model = session.model
+            # P07: a resumed session keeps the edit mode it was created with
+            # unless the caller overrides it explicitly. `session-resume` used
+            # to hard-code write=True, silently re-enabling edits in a run the
+            # user had started read-only.
+            if args.write is None:
+                args.write = bool(store.session_metadata(session.id).get("write", True))
             config = resolve_local_config(args)
             task = " ".join(args.task).strip()
             if not task and not sys.stdin.isatty():
@@ -976,6 +1085,10 @@ def main(argv: list[str] | None = None) -> int:
             store.finish(session.id, result=result)
             print(result)
             return 0
+        except KeyboardInterrupt:
+            # Same contract as `local`: a terminated resume exits 130 without
+            # a traceback (P07).
+            return 130
         except (APIError, LookupError, ValueError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -1009,6 +1122,9 @@ def main(argv: list[str] | None = None) -> int:
                 workspace=str(config.workspace),
                 task=task,
                 model=config.model,
+                # Remember the edit mode so `session-resume` does not silently
+                # turn a read-only run writable (P07).
+                metadata={"write": config.allow_edits},
             )
             trace = TraceRecorder()
             trace_path = store.path.parent / "traces" / f"{session.id}.jsonl"
