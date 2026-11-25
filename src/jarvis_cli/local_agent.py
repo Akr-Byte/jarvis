@@ -405,15 +405,22 @@ class ModelProvider:
             "stream": True,
         }
         if tools is not None:
-            payload["tools"] = [{"type": "function", "function": tool} for tool in tools]
+            payload["tools"] = [
+                {"type": "function", "function": tool} for tool in tools
+            ]
         # Use the Core InferenceClient stream method which yields SSE events
         try:
             stream = self.inference_client.stream(
                 model=self.config.model,
                 messages=to_openai(messages),
-                tools=[{"type": "function", "function": tool} for tool in payload.get("tools", [])]
-                if payload.get("tools")
-                else None,
+                tools=(
+                    [
+                        {"type": "function", "function": tool}
+                        for tool in payload.get("tools", [])
+                    ]
+                    if payload.get("tools")
+                    else None
+                ),
                 max_tokens=min(4_096, self.config.max_output_tokens),
                 timeout=self.config.timeout,
             )
