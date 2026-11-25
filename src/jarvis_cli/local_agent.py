@@ -16,7 +16,7 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -386,6 +386,55 @@ class ModelProvider:
         if self.config.provider == "anthropic":
             return self._anthropic(messages, tools)
         return self._openai(messages, tools)
+
+    def complete_streaming(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield streaming events from the model call.
+
+        Each event dict has the shape:
+        ``{"type": "delta"|"tool_call"|"usage"|"final", "content": ..., "tool_calls": ...}``
+        The final event has ``"type": "final"`` and contains the full result.
+        """
+        assert self.inference_client is not None
+        payload: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": [dict(message) for message in messages],
+            "stream": True,
+        }
+        if tools is not None:
+            payload["tools"] = [{"type": "function", "function": tool} for tool in tools]
+        # Use the Core InferenceClient stream method which yields SSE events
+        try:
+            stream = self.inference_client.stream(
+                model=self.config.model,
+                messages=to_openai(messages),
+                tools=[{"type": "function", "function": tool} for tool in payload.get("tools", [])]
+                if payload.get("tools")
+                else None,
+                max_tokens=min(4_096, self.config.max_output_tokens),
+                timeout=self.config.timeout,
+            )
+            for event in stream:
+                # Core's stream yields raw SSE dicts; normalize them
+                if isinstance(event, dict) and event.get("choices"):
+                    choice = event["choices"][0]
+                    delta = choice.get("delta", {})
+                    finish_reason = choice.get("finish_reason")
+                    yield {
+                        "type": "final" if finish_reason else "delta",
+                        "content": delta.get("content", ""),
+                        "tool_calls": delta.get("tool_calls"),
+                        "role": delta.get("role"),
+                        "finish_reason": finish_reason,
+                        "usage": event.get("usage"),
+                    }
+                else:
+                    yield {"type": "raw", "content": str(event)}
+        except Exception as exc:
+            yield {"type": "error", "content": str(exc)}
 
     def complete_structured(
         self,
@@ -1180,6 +1229,7 @@ def _run_single_agent(
     trace: TraceRecorder | None = None,
     initial_messages: list[dict[str, Any]] | None = None,
     checkpoint: Callable[[list[dict[str, Any]]], None] | None = None,
+    stream: bool = False,
 ) -> str:
     provider = provider or build_model_provider(config)
     ledger = ledger or TokenLedger(
@@ -1263,7 +1313,33 @@ def _run_single_agent(
             input_tokens=turn_input,
         )
         try:
-            text, calls, raw_assistant = provider.complete(messages, active_schemas)
+            if stream:
+                streaming_events: list[dict[str, Any]] = []
+                for event in provider.complete_streaming(messages, active_schemas):
+                    streaming_events.append(event)
+                # Process streaming events: yield deltas, accumulate final result
+                text_parts: list[str] = []
+                tool_calls_collected: list[dict[str, Any]] = []
+                for event in streaming_events:
+                    if event["type"] == "delta":
+                        text_parts.append(event["content"] or "")
+                        if event.get("tool_calls"):
+                            tool_calls_collected.extend(event["tool_calls"])
+                    elif event["type"] == "final":
+                        text_parts.append(event["content"] or "")
+                        # Store the final result messages for later accumulation
+                        if event.get("usage"):
+                            pass  # usage recorded below
+                    elif event["type"] == "tool_call":
+                        tool_calls_collected.append(event["tool_call"])
+                    elif event["type"] == "usage":
+                        pass  # usage recorded below
+                    elif event["type"] == "error":
+                        raise APIError(event["content"])
+                text = "".join(text_parts)
+                calls = tool_calls_collected
+            else:
+                text, calls, raw_assistant = provider.complete(messages, active_schemas)
         except BaseException as exc:
             ledger.refund(reservation)
             decision = classify_failure(exc)

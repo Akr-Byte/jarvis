@@ -81,7 +81,7 @@ def _global_env_paths() -> list[Path]:
 
 for _env_path in _global_env_paths():
     if _env_path.exists():
-        _parse_env_file(_env_path)
+        _parse_env_file(_env_path, denylist=_PROJECT_ENV_DENYLIST)
 
 
 def load_project_env(workspace: str | Path | None = None) -> bool:

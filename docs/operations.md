@@ -51,7 +51,7 @@ export JARVIS_COMMAND_ENV_ALLOW=PRIVATE_PACKAGE_TOKEN
 
 Avoid broad allowlists. Repository code can print an allowed secret into model context.
 
-Default network policy is deny. If the platform cannot enforce a configured deny/allowlist sandbox, Jarvis fails closed unless the operator explicitly chooses permissive/off mode. See the security notes in [world-class-readiness.md](world-class-readiness.md).
+Default network policy is deny. A host `allowlist` is rejected because the OS sandbox cannot filter hosts (see `docs/v0.5-world-class-cli.md`). If the platform cannot enforce a configured deny policy, Jarvis fails closed unless the operator explicitly chooses permissive/off mode. See the security notes in [world-class-readiness.md](world-class-readiness.md).
 
 ## Repository intelligence and attachments
 
