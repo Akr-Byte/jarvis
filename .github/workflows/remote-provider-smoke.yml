@@ -11,7 +11,6 @@ permissions:
 jobs:
   model-doctor:
     runs-on: ubuntu-latest
-    retention-time: "7 days"
     timeout-minutes: 12
     env:
       REMOTE_OPENAI_BASE_URL: ${{ secrets.REMOTE_OPENAI_BASE_URL }}
