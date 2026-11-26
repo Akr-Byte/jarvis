@@ -400,12 +400,17 @@ def test_env_loader_unquotes_values_and_handles_export(tmp_path) -> None:
     }
     env["PYTHONPATH"] = "/mnt/work/code/ai-infra/jarvis/src"
     env.pop("JARVIS_GLOBAL_ENV", None)
+    # R-1: a project .env is only parsed for a trusted workspace; the
+    # operator override marks this scratch repo trusted.
+    env["JARVIS_TRUST_WORKSPACE"] = "true"
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "config-home")
 
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             "import jarvis_cli.main, os, json;"
+            "jarvis_cli.main.load_project_env();"
             "print(json.dumps({key: os.environ.get(key) for key in"
             " ('CLI8_QUOTED', 'CLI8_SINGLE', 'CLI8_BARE')}))",
         ],

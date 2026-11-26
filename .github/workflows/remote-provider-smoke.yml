@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   model-doctor:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
       REMOTE_OPENAI_BASE_URL: ${{ secrets.REMOTE_OPENAI_BASE_URL }}

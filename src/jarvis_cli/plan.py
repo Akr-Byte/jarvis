@@ -69,7 +69,7 @@ Task: {task}"""
         start = output.find("{")
         end = output.rfind("}")
         if start < 0 or end <= start:
-            raise ValueError("Planner did not return structured JSON")
+            raise ValueError("Planner did not return structured JSON") from None
         payload = json.loads(output[start : end + 1])
     if not isinstance(payload, dict):
         raise ValueError("Planner result must be a JSON object")

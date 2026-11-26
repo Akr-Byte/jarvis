@@ -179,6 +179,19 @@ def sandbox_command(
     if policy.mode in {"off", "false", "0", "permissive"}:
         return argv
 
+    if policy.network == "allowlist":
+        # Bubblewrap and the macOS sandbox can only allow or deny networking
+        # wholesale; neither can filter by host behind the sandbox. Treating
+        # "allowlist" as "deny" silently broke every allowlisted command while
+        # looking like a working policy, so fail loudly instead (P07).
+        raise RuntimeError(
+            "Jarvis cannot enforce a host allowlist at the OS sandbox level: "
+            "the sandbox can only allow or deny networking wholesale. Use "
+            "JARVIS_NETWORK=deny (URL-level checks still apply), "
+            "JARVIS_NETWORK=allow, or explicitly set JARVIS_SANDBOX=permissive "
+            "if unrestricted networking is acceptable."
+        )
+
     root = str(Path(workspace).resolve())
     system = platform.system().lower()
     sandboxed: list[str] | None = None

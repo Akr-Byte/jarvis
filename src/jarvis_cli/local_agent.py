@@ -12,11 +12,12 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -166,6 +167,8 @@ class LocalConfig:
     max_input_tokens: int = 16_000
     max_output_tokens: int = 6_000
     think: bool = False
+    # Stream tokens live to stderr while the agent runs (single-agent mode).
+    stream: bool = False
 
 
 def _max_steps_cap() -> int:
@@ -204,7 +207,7 @@ def resolve_local_config(args: Any) -> LocalConfig:
                 raise APIError(
                     "No selected model profile supports tool calling. Configure "
                     "~/.config/jarvis/models.toml or pass a model identifier."
-                )
+                ) from None
     provider = (
         (profile.provider if profile else None)
         or getattr(args, "provider", None)
@@ -278,6 +281,8 @@ def resolve_local_config(args: Any) -> LocalConfig:
         # budget per turn with no answer). Opt in explicitly via JARVIS_THINK.
         think=os.getenv("JARVIS_THINK", "false").strip().lower()
         in {"1", "true", "yes"},
+        stream=bool(getattr(args, "stream", False))
+        or os.getenv("JARVIS_STREAM", "").strip().lower() in {"1", "true", "yes"},
     )
 
 
@@ -386,6 +391,97 @@ class ModelProvider:
         if self.config.provider == "anthropic":
             return self._anthropic(messages, tools)
         return self._openai(messages, tools)
+
+    def complete_streaming(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield streaming events from the model call.
+
+        Events: ``delta`` (incremental text), ``tool_call`` (one fully
+        assembled call, emitted after the stream finishes), ``final`` (full
+        text) and ``error``. Tool-call fragments are accumulated across
+        chunks; usage-only chunks update ``last_usage`` for accounting.
+        """
+        assert self.inference_client is not None
+        tool_payload = (
+            [{"type": "function", "function": tool} for tool in tools]
+            if tools
+            else None
+        )
+        text_parts: list[str] = []
+        pending: dict[int, dict[str, str]] = {}
+        options: dict[str, Any] = {"think": self.config.think}
+        if tool_payload:
+            options["tool_choice"] = "auto"
+        try:
+            stream = self.inference_client.stream(
+                model=self.config.model,
+                messages=to_openai(messages),
+                tools=tool_payload,
+                max_tokens=min(4_096, self.config.max_output_tokens),
+                timeout=self.config.timeout,
+                **options,
+            )
+            for event in stream:
+                if not isinstance(event, dict):
+                    continue
+                usage = event.get("usage")
+                if usage:
+                    self.last_usage = dict(usage)
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0] or {}
+                delta = choice.get("delta") or {}
+                content = delta.get("content")
+                if content:
+                    text_parts.append(str(content))
+                    yield {"type": "delta", "content": str(content)}
+                for fragment in delta.get("tool_calls") or []:
+                    index = int(fragment.get("index", 0) or 0)
+                    slot = pending.setdefault(
+                        index, {"id": "", "name": "", "arguments": ""}
+                    )
+                    if fragment.get("id"):
+                        slot["id"] = str(fragment["id"])
+                    function = fragment.get("function") or {}
+                    if function.get("name"):
+                        slot["name"] += str(function["name"])
+                    if function.get("arguments"):
+                        slot["arguments"] += str(function["arguments"])
+        except InferenceClientError as exc:
+            raise APIError(str(exc)) from exc
+        except Exception as exc:  # network/decoding failures surface as APIError
+            raise APIError(f"Streaming model call failed: {exc}") from exc
+
+        calls: list[dict[str, Any]] = []
+        for index in sorted(pending):
+            slot = pending[index]
+            if not slot["name"]:
+                continue
+            try:
+                arguments = json.loads(slot["arguments"] or "{}")
+            except json.JSONDecodeError as exc:
+                raise APIError(
+                    f"Streaming tool call for {slot['name']!r} returned invalid JSON: {exc}"
+                ) from exc
+            if not isinstance(arguments, dict):
+                raise APIError(
+                    f"Streaming tool call for {slot['name']!r} must decode to an object."
+                )
+            validate_tool_arguments(slot["name"], arguments, tools or [])
+            calls.append(
+                {
+                    "id": slot["id"] or f"jarvis-tool-{index + 1}",
+                    "name": slot["name"],
+                    "arguments": arguments,
+                }
+            )
+        for call in calls:
+            yield {"type": "tool_call", "tool_call": call}
+        yield {"type": "final", "content": "".join(text_parts)}
 
     def complete_structured(
         self,
@@ -860,6 +956,10 @@ class LocalTools:
                     "--hidden",
                     "--glob",
                     "!.git",
+                    # `--` terminates option parsing so a model-supplied
+                    # pattern such as `--pre=<command>` is searched literally
+                    # instead of executed by ripgrep (CLI-18).
+                    "--",
                     str(arguments["pattern"]),
                     str(path),
                 ]
@@ -996,40 +1096,26 @@ class LocalTools:
         if applied.returncode:
             raise APIError(f"Patch application failed: {applied.stderr.strip()}")
         stack = self._patch_stack()
-        if stack is not None:
-            # CLI-12: keep every applied patch, not just the last one, so
-            # `jarvis undo` can walk back through successive applies.
-            try:
-                stack.mkdir(parents=True, exist_ok=True)
-                index = 1 + max(
-                    (int(p.stem) for p in stack.glob("*.patch") if p.stem.isdigit()),
-                    default=0,
-                )
-                (stack / f"{index:03d}.patch").write_text(patch, encoding="utf-8")
-            except OSError:
-                pass
+        # CLI-12: keep every applied patch, not just the last one, so
+        # `jarvis undo` can walk back through successive applies.
+        try:
+            stack.mkdir(parents=True, exist_ok=True)
+            index = 1 + max(
+                (int(p.stem) for p in stack.glob("*.patch") if p.stem.isdigit()),
+                default=0,
+            )
+            (stack / f"{index:03d}.patch").write_text(patch, encoding="utf-8")
+        except OSError:
+            pass
         return (
             "Patch applied transactionally. Inspect with git_diff and run relevant "
             "tests. Use 'jarvis undo' to reverse this patch unless the workspace "
             "changed since; older patches remain undoable in order."
         )
 
-    def _patch_stack(self) -> Path | None:
+    def _patch_stack(self) -> Path:
         """Directory holding the applied-patch stack (newest index last)."""
-        metadata = subprocess.run(
-            ["git", "rev-parse", "--git-path", "jarvis-patches"],
-            cwd=self.root,
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-        if metadata.returncode:
-            return None
-        path = Path(metadata.stdout.strip())
-        if not path.is_absolute():
-            path = self.root / path
-        return path
+        return _workspace_patch_stack(self.root)
 
 
 def _instructions(root: Path) -> str:
@@ -1190,6 +1276,7 @@ def _run_single_agent(
     trace: TraceRecorder | None = None,
     initial_messages: list[dict[str, Any]] | None = None,
     checkpoint: Callable[[list[dict[str, Any]]], None] | None = None,
+    stream: bool = False,
 ) -> str:
     provider = provider or build_model_provider(config)
     ledger = ledger or TokenLedger(
@@ -1273,7 +1360,33 @@ def _run_single_agent(
             input_tokens=turn_input,
         )
         try:
-            text, calls, raw_assistant = provider.complete(messages, active_schemas)
+            if stream:
+                streaming_events: list[dict[str, Any]] = []
+                for event in provider.complete_streaming(messages, active_schemas):
+                    streaming_events.append(event)
+                # Process streaming events: yield deltas, accumulate final result
+                text_parts: list[str] = []
+                tool_calls_collected: list[dict[str, Any]] = []
+                for event in streaming_events:
+                    if event["type"] == "delta":
+                        text_parts.append(event["content"] or "")
+                        if event.get("tool_calls"):
+                            tool_calls_collected.extend(event["tool_calls"])
+                    elif event["type"] == "final":
+                        text_parts.append(event["content"] or "")
+                        # Store the final result messages for later accumulation
+                        if event.get("usage"):
+                            pass  # usage recorded below
+                    elif event["type"] == "tool_call":
+                        tool_calls_collected.append(event["tool_call"])
+                    elif event["type"] == "usage":
+                        pass  # usage recorded below
+                    elif event["type"] == "error":
+                        raise APIError(event["content"])
+                text = "".join(text_parts)
+                calls = tool_calls_collected
+            else:
+                text, calls, raw_assistant = provider.complete(messages, active_schemas)
         except BaseException as exc:
             ledger.refund(reservation)
             decision = classify_failure(exc)
@@ -1396,7 +1509,9 @@ def _run_single_agent(
                         )
                         result = idempotency.execute(
                             key,
-                            lambda: tools.execute(call["name"], call["arguments"]),
+                            lambda name=call["name"], arguments=call[
+                                "arguments"
+                            ]: tools.execute(name, arguments),
                         )
                     else:
                         result = tools.execute(call["name"], call["arguments"])
@@ -1716,7 +1831,14 @@ def run_local_agent(
     )
 
 
-def _workspace_patch_stack(workspace: str | Path) -> Path | None:
+def _workspace_patch_stack(workspace: str | Path) -> Path:
+    """Directory holding applied patches (newest index last).
+
+    Inside a Git repository the stack lives under the Git directory so it
+    never shows up in `git status`. A non-Git workspace previously had no
+    undo history at all, while the tool still claimed undo was available; it
+    now gets a durable stack under `<workspace>/.jarvis/patches` (P07).
+    """
     root = Path(workspace).expanduser().resolve()
     metadata = subprocess.run(
         ["git", "rev-parse", "--git-path", "jarvis-patches"],
@@ -1727,7 +1849,7 @@ def _workspace_patch_stack(workspace: str | Path) -> Path | None:
         check=False,
     )
     if metadata.returncode:
-        return None
+        return root / ".jarvis" / "patches"
     path = Path(metadata.stdout.strip())
     if not path.is_absolute():
         path = root / path
@@ -1765,24 +1887,11 @@ def _reverse_patch(root: Path, patch: str, *, flag: str = "--reverse") -> None:
 def undo_last_patch(workspace: str | Path) -> str:
     """Reverse the most recent Jarvis patch (CLI-12: patches form a stack)."""
     root = Path(workspace).expanduser().resolve()
-    metadata = subprocess.run(
-        ["git", "rev-parse", "--git-path", "jarvis-last.patch"],
-        cwd=root,
-        text=True,
-        capture_output=True,
-        timeout=10,
-        check=False,
-    )
-    if metadata.returncode:
-        raise APIError("Workspace is not a Git repository.")
-
     stack = _workspace_patch_stack(root)
-    stack_files: list[Path] = []
-    if stack is not None:
-        stack_files = sorted(
-            (p for p in stack.glob("*.patch") if p.stem.isdigit()),
-            key=lambda p: int(p.stem),
-        )
+    stack_files = sorted(
+        (p for p in stack.glob("*.patch") if p.stem.isdigit()),
+        key=lambda p: int(p.stem),
+    )
 
     if stack_files:
         # Newest index last; reverse the newest, pop it, keep older ones so a
@@ -1796,15 +1905,24 @@ def undo_last_patch(workspace: str | Path) -> str:
         return f"The most recent Jarvis patch was reversed.{suffix}"
 
     # Backward compatibility: single-patch workspaces predating the stack.
-    legacy = Path(metadata.stdout.strip())
-    if not legacy.is_absolute():
-        legacy = root / legacy
-    if not legacy.is_file():
-        raise APIError("No Jarvis patch is available to undo.")
-    patch = legacy.read_text(encoding="utf-8")
-    _reverse_patch(root, patch)
-    legacy.unlink(missing_ok=True)
-    return "The most recent Jarvis patch was reversed."
+    metadata = subprocess.run(
+        ["git", "rev-parse", "--git-path", "jarvis-last.patch"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    if metadata.returncode == 0:
+        legacy = Path(metadata.stdout.strip())
+        if not legacy.is_absolute():
+            legacy = root / legacy
+        if legacy.is_file():
+            patch = legacy.read_text(encoding="utf-8")
+            _reverse_patch(root, patch)
+            legacy.unlink(missing_ok=True)
+            return "The most recent Jarvis patch was reversed."
+    raise APIError("No Jarvis patch is available to undo.")
 
 
 def interactive_approval(description: str) -> bool:

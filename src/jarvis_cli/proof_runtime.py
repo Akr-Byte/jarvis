@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -21,6 +22,8 @@ except ModuleNotFoundError:  # Python 3.10
 from jarvis_core import ClaimProof, CompletionRequirement, EvidenceGate, ProofKind
 
 from .client import APIError
+
+logger = logging.getLogger("jarvis.proof")
 
 _INSTALLED = False
 _RUN: ContextVar[dict[str, Any] | None] = ContextVar("jarvis_v08_proof", default=None)
@@ -235,7 +238,32 @@ class PermissionPolicy:
         return "ask" if mutation else "allow"
 
 
-def _completion_audit(state: dict[str, Any]) -> dict[str, Any]:
+def _task_requires_tests(task: str) -> bool:
+    """Whether the task explicitly asks for tests/verification (P07).
+
+    Requiring a test proof for every edit rejected perfectly good work that
+    was never asked to include tests; the requirement now follows the task.
+    """
+    lowered = task.casefold()
+    return any(
+        marker in lowered
+        for marker in (" test", "tests", "pytest", "unittest", "verify", "verification")
+    )
+
+
+def _proof_gate_is_strict() -> bool:
+    """The completion gate is advisory by default (P07).
+
+    JARVIS_PROOF_GATE=strict restores the old hard-failure behavior; anything
+    else (the default) records the missing evidence as a warning without
+    discarding the model's answer.
+    """
+    return os.getenv("JARVIS_PROOF_GATE", "warn").strip().casefold() == "strict"
+
+
+def _completion_audit(
+    state: dict[str, Any], *, require_tests: bool = False
+) -> dict[str, Any]:
     """Translate actual execution records into the Core completion contract."""
     records = state.get("records", [])
     proofs: list[ClaimProof] = []
@@ -275,16 +303,17 @@ def _completion_audit(state: dict[str, Any]) -> dict[str, Any]:
                 verified = True
     requirements: list[CompletionRequirement] = []
     if mutated:
-        requirements.extend(
-            [
-                CompletionRequirement(
-                    "apply_patch", (ProofKind.MUTATION, ProofKind.COMMAND)
-                ),
+        requirements.append(
+            CompletionRequirement(
+                "apply_patch", (ProofKind.MUTATION, ProofKind.COMMAND)
+            )
+        )
+        if require_tests:
+            requirements.append(
                 CompletionRequirement(
                     "verification", (ProofKind.TEST, ProofKind.COMMAND)
-                ),
-            ]
-        )
+                )
+            )
     else:
         requirements.append(
             CompletionRequirement(
@@ -427,20 +456,36 @@ def install_proof_runtime() -> None:
         _record("route", config.model, "selected", provider=config.provider)
         try:
             result = base_run(task, config, **kwargs)
-            audit = _completion_audit(state)
+            audit = _completion_audit(state, require_tests=_task_requires_tests(task))
             state["completion_audit"] = audit
             if not audit["passed"]:
-                state["status"] = "incomplete"
+                if _proof_gate_is_strict():
+                    state["status"] = "incomplete"
+                    _record(
+                        "completion",
+                        "agent",
+                        "incomplete",
+                        json.dumps(audit, sort_keys=True),
+                    )
+                    raise APIError(
+                        "Completion evidence gate failed: "
+                        + json.dumps(audit, sort_keys=True)
+                    )
+                # Advisory by default: never discard the model's answer over
+                # missing evidence; record the gap instead (P07).
+                state["status"] = "completed_with_warnings"
+                state["completion_warning"] = audit
                 _record(
                     "completion",
                     "agent",
-                    "incomplete",
+                    "completed_with_warnings",
                     json.dumps(audit, sort_keys=True),
                 )
-                raise APIError(
-                    "Completion evidence gate failed: "
-                    + json.dumps(audit, sort_keys=True)
+                logger.warning(
+                    "completion evidence gap (advisory): %s",
+                    json.dumps(audit, sort_keys=True),
                 )
+                return result
             _record("completion", "agent", "completed", result[-4000:])
             state["status"] = "completed"
             return result

@@ -147,6 +147,26 @@ def _argument_path(arguments: dict[str, Any]) -> str | None:
     return None
 
 
+# Paths that may never be created or modified by a plan, regardless of the
+# task: repository metadata, environment/secrets, and Jarvis' own trust and
+# hook configuration. Reused by the new-file policy below (P07).
+_PROTECTED_NEW_FILE_PREFIXES = (
+    ".git/",
+    ".jarvis/",
+    ".env",
+)
+
+
+def _is_protected_new_path(normalized: str) -> bool:
+    lowered = normalized.casefold()
+    if lowered == ".env" or lowered.startswith(".env."):
+        return True
+    return any(
+        lowered == prefix.rstrip("/") or lowered.startswith(prefix)
+        for prefix in _PROTECTED_NEW_FILE_PREFIXES
+    )
+
+
 def _allowed(
     path: str,
     plan: PatchPlan,
@@ -170,11 +190,12 @@ def _allowed(
         return False
     if not plan.allow_new_files:
         return False
-    parents = {str(Path(item).parent).replace("\\", "/") for item in plan.paths}
-    parent = str(Path(normalized).parent).replace("\\", "/")
-    return parent in parents or any(
-        part in {"src", "tests", "test", "docs"} for part in Path(normalized).parts
-    )
+    if _is_protected_new_path(normalized):
+        return False
+    # A creation request may legitimately add any new file inside the
+    # workspace (Makefile, README, config at the root, ...); the old
+    # parent-of-plan / src|tests|docs allowlist rejected those (P07).
+    return True
 
 
 def _extract_evidence_footer(result: str) -> dict[str, Any]:

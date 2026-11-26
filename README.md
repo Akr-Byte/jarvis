@@ -93,7 +93,7 @@ cd jarvis
 python3 -m pip install -e .
 ```
 
-Jarvis 0.12.6 consumes `jarvis-agent-core==0.18.0` from PyPI. The dependency is pinned to the exact
+Jarvis 0.12.7 consumes `jarvis-agent-core==0.18.2` from PyPI. The dependency is pinned to the exact
 Core release in `pyproject.toml`.
 
 See [docs/install.md](docs/install.md) for the complete distribution and upgrade guide.
@@ -139,10 +139,10 @@ is worth the wall-clock cost.
 
 ## Current contract line
 
-Jarvis **0.12.6** consumes the provider-neutral Jarvis Core **0.18.0** contracts. All model requests
+Jarvis **0.12.7** consumes the provider-neutral Jarvis Core **0.18.2** contracts. All model requests
 use the direct inference API; the CLI has no AI Stack remote execution mode.
 
-Jarvis Core 0.18.0 is published as an immutable PyPI release; the CLI pins that exact release so
+Jarvis Core 0.18.2 is published as an immutable PyPI release; the CLI pins that exact release so
 Jarvis and Core can evolve independently.
 
 Jarvis is a standalone local coding agent. The agent loop and tools run on the user's machine, and all
@@ -186,7 +186,7 @@ jobs/cron and observability.
 
 ## Token-efficient runtime
 
-Core 0.18.0 provides provider-neutral primitives for bounded context construction, token/cost
+Core 0.18.2 provides provider-neutral primitives for bounded context construction, token/cost
 estimation, route budgets, adaptive routing and empirical route calibration. Jarvis keeps inference
 execution policy in the CLI, while shared efficiency and calibration contracts remain provider-neutral
 in Core.

@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 import os
 
-CORE_VERSION = "0.18.0"
+CORE_VERSION = "0.18.2"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
