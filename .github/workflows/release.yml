@@ -22,6 +22,7 @@ jobs:
   validate-and-build:
     name: Validate and build exact release SHA
     runs-on: ubuntu-latest
+    retention-time: '7 days'
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
