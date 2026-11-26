@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -166,6 +167,8 @@ class LocalConfig:
     max_input_tokens: int = 16_000
     max_output_tokens: int = 6_000
     think: bool = False
+    # Stream tokens live to stderr while the agent runs (single-agent mode).
+    stream: bool = False
 
 
 def _max_steps_cap() -> int:
@@ -204,7 +207,7 @@ def resolve_local_config(args: Any) -> LocalConfig:
                 raise APIError(
                     "No selected model profile supports tool calling. Configure "
                     "~/.config/jarvis/models.toml or pass a model identifier."
-                )
+                ) from None
     provider = (
         (profile.provider if profile else None)
         or getattr(args, "provider", None)
@@ -278,6 +281,8 @@ def resolve_local_config(args: Any) -> LocalConfig:
         # budget per turn with no answer). Opt in explicitly via JARVIS_THINK.
         think=os.getenv("JARVIS_THINK", "false").strip().lower()
         in {"1", "true", "yes"},
+        stream=bool(getattr(args, "stream", False))
+        or os.getenv("JARVIS_STREAM", "").strip().lower() in {"1", "true", "yes"},
     )
 
 
@@ -394,54 +399,89 @@ class ModelProvider:
     ) -> Iterator[dict[str, Any]]:
         """Yield streaming events from the model call.
 
-        Each event dict has the shape:
-        ``{"type": "delta"|"tool_call"|"usage"|"final", "content": ..., "tool_calls": ...}``
-        The final event has ``"type": "final"`` and contains the full result.
+        Events: ``delta`` (incremental text), ``tool_call`` (one fully
+        assembled call, emitted after the stream finishes), ``final`` (full
+        text) and ``error``. Tool-call fragments are accumulated across
+        chunks; usage-only chunks update ``last_usage`` for accounting.
         """
         assert self.inference_client is not None
-        payload: dict[str, Any] = {
-            "model": self.config.model,
-            "messages": [dict(message) for message in messages],
-            "stream": True,
-        }
-        if tools is not None:
-            payload["tools"] = [
-                {"type": "function", "function": tool} for tool in tools
-            ]
-        # Use the Core InferenceClient stream method which yields SSE events
+        tool_payload = (
+            [{"type": "function", "function": tool} for tool in tools]
+            if tools
+            else None
+        )
+        text_parts: list[str] = []
+        pending: dict[int, dict[str, str]] = {}
+        options: dict[str, Any] = {"think": self.config.think}
+        if tool_payload:
+            options["tool_choice"] = "auto"
         try:
             stream = self.inference_client.stream(
                 model=self.config.model,
                 messages=to_openai(messages),
-                tools=(
-                    [
-                        {"type": "function", "function": tool}
-                        for tool in payload.get("tools", [])
-                    ]
-                    if payload.get("tools")
-                    else None
-                ),
+                tools=tool_payload,
                 max_tokens=min(4_096, self.config.max_output_tokens),
                 timeout=self.config.timeout,
+                **options,
             )
             for event in stream:
-                # Core's stream yields raw SSE dicts; normalize them
-                if isinstance(event, dict) and event.get("choices"):
-                    choice = event["choices"][0]
-                    delta = choice.get("delta", {})
-                    finish_reason = choice.get("finish_reason")
-                    yield {
-                        "type": "final" if finish_reason else "delta",
-                        "content": delta.get("content", ""),
-                        "tool_calls": delta.get("tool_calls"),
-                        "role": delta.get("role"),
-                        "finish_reason": finish_reason,
-                        "usage": event.get("usage"),
-                    }
-                else:
-                    yield {"type": "raw", "content": str(event)}
-        except Exception as exc:
-            yield {"type": "error", "content": str(exc)}
+                if not isinstance(event, dict):
+                    continue
+                usage = event.get("usage")
+                if usage:
+                    self.last_usage = dict(usage)
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0] or {}
+                delta = choice.get("delta") or {}
+                content = delta.get("content")
+                if content:
+                    text_parts.append(str(content))
+                    yield {"type": "delta", "content": str(content)}
+                for fragment in delta.get("tool_calls") or []:
+                    index = int(fragment.get("index", 0) or 0)
+                    slot = pending.setdefault(
+                        index, {"id": "", "name": "", "arguments": ""}
+                    )
+                    if fragment.get("id"):
+                        slot["id"] = str(fragment["id"])
+                    function = fragment.get("function") or {}
+                    if function.get("name"):
+                        slot["name"] += str(function["name"])
+                    if function.get("arguments"):
+                        slot["arguments"] += str(function["arguments"])
+        except InferenceClientError as exc:
+            raise APIError(str(exc)) from exc
+        except Exception as exc:  # network/decoding failures surface as APIError
+            raise APIError(f"Streaming model call failed: {exc}") from exc
+
+        calls: list[dict[str, Any]] = []
+        for index in sorted(pending):
+            slot = pending[index]
+            if not slot["name"]:
+                continue
+            try:
+                arguments = json.loads(slot["arguments"] or "{}")
+            except json.JSONDecodeError as exc:
+                raise APIError(
+                    f"Streaming tool call for {slot['name']!r} returned invalid JSON: {exc}"
+                ) from exc
+            if not isinstance(arguments, dict):
+                raise APIError(
+                    f"Streaming tool call for {slot['name']!r} must decode to an object."
+                )
+            validate_tool_arguments(slot["name"], arguments, tools or [])
+            calls.append(
+                {
+                    "id": slot["id"] or f"jarvis-tool-{index + 1}",
+                    "name": slot["name"],
+                    "arguments": arguments,
+                }
+            )
+        for call in calls:
+            yield {"type": "tool_call", "tool_call": call}
+        yield {"type": "final", "content": "".join(text_parts)}
 
     def complete_structured(
         self,
@@ -1469,7 +1509,9 @@ def _run_single_agent(
                         )
                         result = idempotency.execute(
                             key,
-                            lambda: tools.execute(call["name"], call["arguments"]),
+                            lambda name=call["name"], arguments=call[
+                                "arguments"
+                            ]: tools.execute(name, arguments),
                         )
                     else:
                         result = tools.execute(call["name"], call["arguments"])

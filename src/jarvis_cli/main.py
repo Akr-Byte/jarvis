@@ -406,6 +406,7 @@ def _common_suffix(left: Path, right: Path) -> int:
     for left_part, right_part in zip(
         reversed(left.parts),
         reversed(right.parts),
+        strict=False,
     ):
         if left_part != right_part:
             break
