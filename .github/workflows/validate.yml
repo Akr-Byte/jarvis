@@ -63,7 +63,7 @@ jobs:
         with:
           name: pytest-log-${{ matrix.python-version }}
           path: /tmp/jarvis-pytest.log
-          retention-days: 7
+          retention-days: 1
       - run: python -m build
       - run: python -m twine check dist/*
       - name: Clean wheel installation
@@ -84,4 +84,4 @@ jobs:
           name: certification-evidence-${{ github.sha }}-python-${{ matrix.python-version }}
           path: certification-evidence.json
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
